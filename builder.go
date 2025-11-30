@@ -101,8 +101,17 @@ func (b *Ext4ImageBuilder) CreateDirectory(parentInodeNum uint32, name string, m
 	return newInodeNum
 }
 
-// CreateFile creates a new file in the filesystem
+// CreateFile creates a new file in the filesystem or overwrites an existing one
 func (b *Ext4ImageBuilder) CreateFile(parentInodeNum uint32, name string, content []byte, mode, uid, gid uint16) uint32 {
+	// Check if file already exists
+	existingInode := b.findInodeByName(parentInodeNum, name)
+
+	if existingInode != 0 {
+		// File exists - overwrite it
+		return b.overwriteFile(existingInode, content, mode, uid, gid, name)
+	}
+
+	// File doesn't exist - create new one
 	// Allocate inode for new file
 	newInodeNum := b.allocateInode()
 
@@ -154,6 +163,58 @@ func (b *Ext4ImageBuilder) CreateFile(parentInodeNum uint32, name string, conten
 		name, newInodeNum, size, uid, gid, mode)
 
 	return newInodeNum
+}
+
+// overwriteFile overwrites an existing file with new content, mode, uid, and gid
+func (b *Ext4ImageBuilder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid uint16, name string) uint32 {
+	// Free existing blocks
+	b.freeInodeBlocks(inodeNum)
+
+	// Calculate blocks needed for new content
+	size := uint32(len(content))
+	blocksNeeded := (size + BlockSize - 1) / BlockSize
+	if blocksNeeded == 0 {
+		blocksNeeded = 1
+	}
+
+	// Update inode with new metadata
+	fileInode := b.createFileInode(mode, uid, gid, size)
+	b.writeInode(inodeNum, fileInode)
+
+	// Allocate new data blocks
+	if blocksNeeded > 0 {
+		blocks := b.allocateBlocks(blocksNeeded)
+		b.setInodeBlocks(inodeNum, blocks)
+
+		// Write content to blocks
+		for i, blockNum := range blocks {
+			startIdx := i * BlockSize
+			if startIdx >= len(content) {
+				break
+			}
+			endIdx := startIdx + BlockSize
+			if endIdx > len(content) {
+				endIdx = len(content)
+			}
+
+			blockOffset := b.blockOffset(blockNum)
+			// Zero out the entire block first
+			zeroed := make([]byte, BlockSize)
+			b.writeAt(blockOffset, zeroed)
+			// Then write actual content
+			b.writeAt(blockOffset, content[startIdx:endIdx])
+		}
+	}
+
+	// Update inode blocks count
+	fileInode = b.readInode(inodeNum)
+	fileInode.BlocksLo = blocksNeeded * (BlockSize / 512)
+	b.writeInode(inodeNum, fileInode)
+
+	fmt.Printf("  ✓ Overwritten file: %s (inode %d, size=%d, uid=%d, gid=%d, mode=%04o)\n",
+		name, inodeNum, size, uid, gid, mode)
+
+	return inodeNum
 }
 
 // CreateSymlink creates a symbolic link
@@ -984,6 +1045,104 @@ func (b *Ext4ImageBuilder) writeDirEntries(blockNum uint32, entries []Ext4DirEnt
 	}
 
 	b.writeAt(offset, block)
+}
+
+// findInodeByName searches for a file/directory by name in a directory and returns its inode number.
+// Returns 0 if not found.
+func (b *Ext4ImageBuilder) findInodeByName(dirInodeNum uint32, name string) uint32 {
+	// Read directory inode to get data block
+	dirInode := b.readInode(dirInodeNum)
+
+	// Get the data block from extent
+	dataBlock := binary.LittleEndian.Uint32(dirInode.Block[20:24]) // extent start_lo
+
+	// Read directory block
+	offset := b.blockOffset(dataBlock)
+	block := make([]byte, BlockSize)
+	b.readAt(offset, block)
+
+	// Search for the entry
+	currentOffset := 0
+	for currentOffset < BlockSize {
+		recLen := binary.LittleEndian.Uint16(block[currentOffset+4:])
+		if recLen == 0 {
+			break
+		}
+
+		nameLen := block[currentOffset+6]
+		entryName := string(block[currentOffset+8 : currentOffset+8+int(nameLen)])
+
+		if entryName == name {
+			inodeNum := binary.LittleEndian.Uint32(block[currentOffset:])
+			return inodeNum
+		}
+
+		currentOffset += int(recLen)
+		if currentOffset >= BlockSize {
+			break
+		}
+	}
+
+	return 0 // Not found
+}
+
+// freeInodeBlocks frees all data blocks allocated to an inode
+func (b *Ext4ImageBuilder) freeInodeBlocks(inodeNum uint32) {
+	inode := b.readInode(inodeNum)
+	if inode == nil {
+		return
+	}
+
+	// Only handle extent-based files
+	if (inode.Flags & 0x00080000) == 0 {
+		return // Not using extents
+	}
+
+	// Read extent header
+	entries := binary.LittleEndian.Uint16(inode.Block[2:4])
+
+	// Free each extent
+	for i := uint16(0); i < entries && i < 4; i++ {
+		extentOffset := 12 + (i * 12) // Each extent is 12 bytes, header is 12 bytes
+		if extentOffset+12 > 60 {
+			break
+		}
+
+		// Ext4Extent structure: Block(4), Len(2), StartHi(2), StartLo(4)
+		length := binary.LittleEndian.Uint16(inode.Block[extentOffset+4:])
+		startLo := binary.LittleEndian.Uint32(inode.Block[extentOffset+8:])
+
+		// Free each block in the extent
+		for j := uint16(0); j < length; j++ {
+			blockNum := startLo + uint32(j)
+			b.freeBlock(blockNum)
+		}
+	}
+}
+
+// freeBlock marks a block as free in the block bitmap
+func (b *Ext4ImageBuilder) freeBlock(blockNum uint32) {
+	if blockNum >= b.blockCount {
+		return
+	}
+
+	group := blockNum / BlocksPerGroup
+	indexInGroup := blockNum % BlocksPerGroup
+
+	groupStart := group * BlocksPerGroup
+	overhead := b.calculateGroupOverhead(group)
+
+	blockBitmapBlock := groupStart + overhead
+	bitmapOffset := b.blockOffset(blockBitmapBlock)
+
+	byteIndex := indexInGroup / 8
+	bitIndex := indexInGroup % 8
+
+	offset := bitmapOffset + uint64(byteIndex)
+	buf := make([]byte, 1)
+	b.readAt(offset, buf)
+	buf[0] &^= 1 << bitIndex // Clear the bit
+	b.writeAt(offset, buf)
 }
 
 // addDirEntry adds a new entry to a directory

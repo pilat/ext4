@@ -252,6 +252,232 @@ func TestFileCreation(t *testing.T) {
 	}
 }
 
+// TestFileOverwriting tests overwriting files with new content, permissions, and ownership
+func TestFileOverwriting(t *testing.T) {
+	skipIfNoDocker(t)
+
+	testCases := []struct {
+		name            string
+		originalContent string
+		originalMode    uint16
+		originalUID     uint16
+		originalGID     uint16
+		newContent      string
+		newMode         uint16
+		newUID          uint16
+		newGID          uint16
+	}{
+		{
+			name:            "overwrite with larger content",
+			originalContent: "tiny",
+			originalMode:    0644,
+			originalUID:     0,
+			originalGID:     0,
+			newContent:      "This is a much longer content that should completely replace the original file data",
+			newMode:         0644,
+			newUID:          0,
+			newGID:          0,
+		},
+		{
+			name:            "overwrite with smaller content",
+			originalContent: "This is a very long original content that will be replaced with something shorter",
+			originalMode:    0644,
+			originalUID:     0,
+			originalGID:     0,
+			newContent:      "short",
+			newMode:         0644,
+			newUID:          0,
+			newGID:          0,
+		},
+		{
+			name:            "overwrite with different permissions",
+			originalContent: "test content",
+			originalMode:    0644,
+			originalUID:     0,
+			originalGID:     0,
+			newContent:      "test content",
+			newMode:         0600,
+			newUID:          0,
+			newGID:          0,
+		},
+		{
+			name:            "overwrite with different ownership",
+			originalContent: "test content",
+			originalMode:    0644,
+			originalUID:     0,
+			originalGID:     0,
+			newContent:      "test content",
+			newMode:         0644,
+			newUID:          1000,
+			newGID:          1000,
+		},
+		{
+			name:            "overwrite everything",
+			originalContent: "original",
+			originalMode:    0644,
+			originalUID:     0,
+			originalGID:     0,
+			newContent:      "completely new content with different everything",
+			newMode:         0755,
+			newUID:          500,
+			newGID:          500,
+		},
+		{
+			name:            "overwrite empty file",
+			originalContent: "",
+			originalMode:    0644,
+			originalUID:     0,
+			originalGID:     0,
+			newContent:      "now has content",
+			newMode:         0644,
+			newUID:          0,
+			newGID:          0,
+		},
+		{
+			name:            "overwrite to empty file",
+			originalContent: "has content",
+			originalMode:    0644,
+			originalUID:     0,
+			originalGID:     0,
+			newContent:      "",
+			newMode:         0644,
+			newUID:          0,
+			newGID:          0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := newTestContext(t, defaultImageSizeMB)
+			ctx.builder.PrepareFilesystem()
+
+			filename := "testfile.txt"
+
+			// Create original file
+			ctx.builder.CreateFile(ext4.RootInode, filename, []byte(tc.originalContent), tc.originalMode, tc.originalUID, tc.originalGID)
+
+			// Overwrite the file
+			ctx.builder.CreateFile(ext4.RootInode, filename, []byte(tc.newContent), tc.newMode, tc.newUID, tc.newGID)
+
+			ctx.finalize()
+
+			// Verify file exists with new content, permissions, and ownership
+			commands := []string{
+				fmt.Sprintf(`test -f "%s" && echo "file exists"`, filename),
+			}
+
+			if tc.newContent != "" {
+				commands = append(commands, fmt.Sprintf(`cat "%s"`, filename))
+			} else {
+				// For empty files, check size is 0
+				commands = append(commands, fmt.Sprintf(`[ $(stat -c %%s "%s") -eq 0 ] && echo "file is empty"`, filename))
+			}
+
+			// Check permissions
+			commands = append(commands, fmt.Sprintf(`stat -c "%%a" "%s"`, filename))
+
+			// Check ownership
+			commands = append(commands, fmt.Sprintf(`stat -c "%%u:%%g" "%s"`, filename))
+
+			output := ctx.dockerExecSimple(commands...)
+
+			assert.Contains(t, output, "file exists")
+			if tc.newContent != "" {
+				assert.Contains(t, output, tc.newContent)
+				// Only check that original content is not present if it's different from new content
+				if tc.originalContent != tc.newContent && tc.originalContent != "" {
+					assert.NotContains(t, output, tc.originalContent, "should not contain original content")
+				}
+			} else {
+				assert.Contains(t, output, "file is empty")
+			}
+			assert.Contains(t, output, fmt.Sprintf("%o", tc.newMode))
+			assert.Contains(t, output, fmt.Sprintf("%d:%d", tc.newUID, tc.newGID))
+		})
+	}
+}
+
+// TestMultipleFileOverwrites tests overwriting the same file multiple times
+func TestMultipleFileOverwrites(t *testing.T) {
+	skipIfNoDocker(t)
+
+	ctx := newTestContext(t, defaultImageSizeMB)
+	ctx.builder.PrepareFilesystem()
+
+	filename := "multi-overwrite.txt"
+
+	// Create and overwrite the file multiple times
+	contents := []string{
+		"First version",
+		"Second version - longer content",
+		"Third",
+		"Fourth version with even more content than before",
+		"Final version",
+	}
+
+	modes := []uint16{0644, 0600, 0755, 0400, 0777}
+	uids := []uint16{0, 1000, 500, 0, 1001}
+	gids := []uint16{0, 1000, 500, 0, 1001}
+
+	for i, content := range contents {
+		ctx.builder.CreateFile(ext4.RootInode, filename, []byte(content), modes[i], uids[i], gids[i])
+	}
+
+	ctx.finalize()
+
+	// Verify only the final version is present
+	output := ctx.dockerExecSimple(
+		fmt.Sprintf(`test -f "%s" && echo "file exists"`, filename),
+		fmt.Sprintf(`cat "%s"`, filename),
+		fmt.Sprintf(`stat -c "%%a" "%s"`, filename),
+		fmt.Sprintf(`stat -c "%%u:%%g" "%s"`, filename),
+	)
+
+	assert.Contains(t, output, "file exists")
+	assert.Contains(t, output, contents[len(contents)-1])
+	// Should not contain earlier versions
+	for i := 0; i < len(contents)-1; i++ {
+		assert.NotContains(t, output, contents[i])
+	}
+	assert.Contains(t, output, fmt.Sprintf("%o", modes[len(modes)-1]))
+	assert.Contains(t, output, fmt.Sprintf("%d:%d", uids[len(uids)-1], gids[len(gids)-1]))
+}
+
+// TestOverwriteInSubdirectory tests overwriting files in subdirectories
+func TestOverwriteInSubdirectory(t *testing.T) {
+	skipIfNoDocker(t)
+
+	ctx := newTestContext(t, defaultImageSizeMB)
+	ctx.builder.PrepareFilesystem()
+
+	// Create a subdirectory
+	subdir := ctx.builder.CreateDirectory(ext4.RootInode, "subdir", 0755, 0, 0)
+
+	filename := "file.txt"
+
+	// Create original file in subdirectory
+	ctx.builder.CreateFile(subdir, filename, []byte("original content"), 0644, 0, 0)
+
+	// Overwrite the file
+	ctx.builder.CreateFile(subdir, filename, []byte("new content"), 0600, 1000, 1000)
+
+	ctx.finalize()
+
+	// Verify the overwritten file
+	output := ctx.dockerExecSimple(
+		`test -f "subdir/file.txt" && echo "file exists"`,
+		`cat "subdir/file.txt"`,
+		`stat -c "%a" "subdir/file.txt"`,
+		`stat -c "%u:%g" "subdir/file.txt"`,
+	)
+
+	assert.Contains(t, output, "file exists")
+	assert.Contains(t, output, "new content")
+	assert.NotContains(t, output, "original content")
+	assert.Contains(t, output, "600")
+	assert.Contains(t, output, "1000:1000")
+}
+
 // TestDirectoryCreation tests creating directories with various structures
 func TestDirectoryCreation(t *testing.T) {
 	skipIfNoDocker(t)
