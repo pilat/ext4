@@ -1,5 +1,10 @@
 package ext4fs
 
+import (
+	"fmt"
+	"strings"
+)
+
 // isSparseGroup checks if group should have superblock backup
 func isSparseGroup(group uint32) bool {
 	if group <= 1 {
@@ -35,4 +40,24 @@ func lbaToCHS(lba uint32) [3]byte {
 		byte((sector & 0x3F) | ((cylinder >> 2) & 0xC0)),
 		byte(cylinder & 0xFF),
 	}
+}
+
+// validateName checks if a filename is valid for ext4
+func validateName(name string) error {
+	if len(name) == 0 {
+		return fmt.Errorf("filename cannot be empty")
+	}
+	if len(name) > 255 {
+		return fmt.Errorf("filename too long: %d > 255", len(name))
+	}
+	if strings.Contains(name, "/") {
+		return fmt.Errorf("filename cannot contain '/'")
+	}
+	if strings.Contains(name, "\x00") {
+		return fmt.Errorf("filename cannot contain null byte")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("filename cannot be '.' or '..'")
+	}
+	return nil
 }

@@ -80,17 +80,17 @@ func (e *Ext4ImageBuilder) PrepareFilesystem() {
 }
 
 // CreateDirectory creates a directory
-func (e *Ext4ImageBuilder) CreateDirectory(parent uint32, name string, mode, uid, gid uint16) uint32 {
+func (e *Ext4ImageBuilder) CreateDirectory(parent uint32, name string, mode, uid, gid uint16) (uint32, error) {
 	return e.builder.CreateDirectory(parent, name, mode, uid, gid)
 }
 
 // CreateFile creates a file
-func (e *Ext4ImageBuilder) CreateFile(parent uint32, name string, content []byte, mode, uid, gid uint16) uint32 {
+func (e *Ext4ImageBuilder) CreateFile(parent uint32, name string, content []byte, mode, uid, gid uint16) (uint32, error) {
 	return e.builder.CreateFile(parent, name, content, mode, uid, gid)
 }
 
 // CreateSymlink creates a symbolic link
-func (e *Ext4ImageBuilder) CreateSymlink(parent uint32, name, target string, uid, gid uint16) uint32 {
+func (e *Ext4ImageBuilder) CreateSymlink(parent uint32, name, target string, uid, gid uint16) (uint32, error) {
 	return e.builder.CreateSymlink(parent, name, target, uid, gid)
 }
 

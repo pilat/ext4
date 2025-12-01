@@ -457,7 +457,8 @@ func TestOverwriteInSubdirectory(t *testing.T) {
 	ctx.builder.PrepareFilesystem()
 
 	// Create a subdirectory
-	subdir := ctx.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+	subdir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+	require.NoError(t, err)
 
 	filename := "file.txt"
 
@@ -508,8 +509,10 @@ func TestDirectoryCreation(t *testing.T) {
 		{
 			name: "nested directories",
 			structure: func(b *ext4fs.Ext4ImageBuilder) {
-				dir1 := b.CreateDirectory(ext4fs.RootInode, "level1", 0755, 0, 0)
-				dir2 := b.CreateDirectory(dir1, "level2", 0755, 0, 0)
+				dir1, err := b.CreateDirectory(ext4fs.RootInode, "level1", 0755, 0, 0)
+				require.NoError(t, err)
+				dir2, err := b.CreateDirectory(dir1, "level2", 0755, 0, 0)
+				require.NoError(t, err)
 				b.CreateDirectory(dir2, "level3", 0755, 0, 0)
 			},
 			verify: []string{
@@ -596,7 +599,8 @@ func TestSymlinkCreation(t *testing.T) {
 		{
 			name: "symlink to directory",
 			setup: func(b *ext4fs.Ext4ImageBuilder) {
-				dir := b.CreateDirectory(ext4fs.RootInode, "realdir", 0755, 0, 0)
+				dir, err := b.CreateDirectory(ext4fs.RootInode, "realdir", 0755, 0, 0)
+				require.NoError(t, err)
 				b.CreateFile(dir, "file.txt", []byte("in dir"), 0644, 0, 0)
 				b.CreateSymlink(ext4fs.RootInode, "linkdir", "realdir", 0, 0)
 			},
@@ -609,7 +613,8 @@ func TestSymlinkCreation(t *testing.T) {
 		{
 			name: "relative symlink",
 			setup: func(b *ext4fs.Ext4ImageBuilder) {
-				dir := b.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+				dir, err := b.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+				require.NoError(t, err)
 				b.CreateFile(ext4fs.RootInode, "root.txt", []byte("root file"), 0644, 0, 0)
 				b.CreateSymlink(dir, "toroot", "../root.txt", 0, 0)
 			},
@@ -645,19 +650,24 @@ func TestComplexFilesystem(t *testing.T) {
 	ctx.builder.PrepareFilesystem()
 
 	// Create /etc with config files
-	etcDir := ctx.builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
+	etcDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
+	require.NoError(t, err)
 	ctx.builder.CreateFile(etcDir, "passwd", []byte("root:x:0:0:root:/root:/bin/sh\n"), 0644, 0, 0)
 	ctx.builder.CreateFile(etcDir, "hostname", []byte("testhost\n"), 0644, 0, 0)
 
 	// Create /home/user
-	homeDir := ctx.builder.CreateDirectory(ext4fs.RootInode, "home", 0755, 0, 0)
-	userDir := ctx.builder.CreateDirectory(homeDir, "user", 0750, 1000, 1000)
+	homeDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "home", 0755, 0, 0)
+	require.NoError(t, err)
+	userDir, err := ctx.builder.CreateDirectory(homeDir, "user", 0750, 1000, 1000)
+	require.NoError(t, err)
 	ctx.builder.CreateFile(userDir, ".bashrc", []byte("export PS1='$ '\n"), 0644, 1000, 1000)
 	ctx.builder.CreateFile(userDir, ".profile", []byte("# profile\n"), 0644, 1000, 1000)
 
 	// Create /var/log
-	varDir := ctx.builder.CreateDirectory(ext4fs.RootInode, "var", 0755, 0, 0)
-	logDir := ctx.builder.CreateDirectory(varDir, "log", 0755, 0, 0)
+	varDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "var", 0755, 0, 0)
+	require.NoError(t, err)
+	logDir, err := ctx.builder.CreateDirectory(varDir, "log", 0755, 0, 0)
+	require.NoError(t, err)
 	ctx.builder.CreateFile(logDir, "messages", []byte("system started\n"), 0640, 0, 4)
 
 	// Create /tmp with sticky bit
@@ -761,7 +771,8 @@ func TestFilesystemIntegrity(t *testing.T) {
 		{
 			name: "filesystem with directories",
 			setup: func(b *ext4fs.Ext4ImageBuilder) {
-				dir := b.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+				dir, err := b.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+				require.NoError(t, err)
 				b.CreateFile(dir, "nested.txt", []byte("nested"), 0644, 0, 0)
 			},
 		},
@@ -770,7 +781,8 @@ func TestFilesystemIntegrity(t *testing.T) {
 			setup: func(b *ext4fs.Ext4ImageBuilder) {
 				for i := 0; i < 5; i++ {
 					dirName := fmt.Sprintf("dir%d", i)
-					dir := b.CreateDirectory(ext4fs.RootInode, dirName, 0755, 0, 0)
+					dir, err := b.CreateDirectory(ext4fs.RootInode, dirName, 0755, 0, 0)
+					require.NoError(t, err)
 					for j := 0; j < 3; j++ {
 						fileName := fmt.Sprintf("file%d.txt", j)
 						content := fmt.Sprintf("Content of %s/%s\n", dirName, fileName)
@@ -816,7 +828,8 @@ func TestDifferentImageSizes(t *testing.T) {
 
 			// Add some content
 			ctx.builder.CreateFile(ext4fs.RootInode, "test.txt", []byte("test content"), 0644, 0, 0)
-			dir := ctx.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+			dir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+			require.NoError(t, err)
 			ctx.builder.CreateFile(dir, "nested.txt", []byte("nested content"), 0644, 0, 0)
 
 			ctx.finalize()
@@ -905,7 +918,8 @@ func TestMultiBlockDirectory(t *testing.T) {
 	// Each directory entry takes roughly 12-24 bytes (depends on name length)
 	// A 4KB block can hold approximately 170-340 entries
 	// We'll create 400 files to ensure we need at least 2 blocks
-	testDir := tc.builder.CreateDirectory(ext4fs.RootInode, "many_files", 0755, 0, 0)
+	testDir, err := tc.builder.CreateDirectory(ext4fs.RootInode, "many_files", 0755, 0, 0)
+	require.NoError(t, err)
 
 	numFiles := 400
 	for i := 0; i < numFiles; i++ {
@@ -943,7 +957,8 @@ func TestMultiBlockDirectoryWithSymlinks(t *testing.T) {
 	tc.builder.PrepareFilesystem()
 
 	// Create a directory with mixed content types
-	testDir := tc.builder.CreateDirectory(ext4fs.RootInode, "mixed_dir", 0755, 0, 0)
+	testDir, err := tc.builder.CreateDirectory(ext4fs.RootInode, "mixed_dir", 0755, 0, 0)
+	require.NoError(t, err)
 
 	// Add 100 regular files
 	for i := 0; i < 100; i++ {
@@ -995,7 +1010,8 @@ func TestMultiBlockDirectoryNested(t *testing.T) {
 	tc.builder.PrepareFilesystem()
 
 	// Create nested structure with many files at each level
-	level1 := tc.builder.CreateDirectory(ext4fs.RootInode, "level1", 0755, 0, 0)
+	level1, err := tc.builder.CreateDirectory(ext4fs.RootInode, "level1", 0755, 0, 0)
+	require.NoError(t, err)
 
 	// Add many files to level1
 	for i := 0; i < 200; i++ {
@@ -1003,7 +1019,8 @@ func TestMultiBlockDirectoryNested(t *testing.T) {
 		tc.builder.CreateFile(level1, fileName, []byte("level 1 content"), 0644, 0, 0)
 	}
 
-	level2 := tc.builder.CreateDirectory(level1, "level2", 0755, 0, 0)
+	level2, err := tc.builder.CreateDirectory(level1, "level2", 0755, 0, 0)
+	require.NoError(t, err)
 
 	// Add many files to level2
 	for i := 0; i < 200; i++ {
@@ -1044,7 +1061,8 @@ func BenchmarkFilesystemCreation(b *testing.B) {
 		// Create some content
 		for j := 0; j < 10; j++ {
 			dirName := fmt.Sprintf("dir%d", j)
-			dir := builder.CreateDirectory(ext4fs.RootInode, dirName, 0755, 0, 0)
+			dir, err := builder.CreateDirectory(ext4fs.RootInode, dirName, 0755, 0, 0)
+			require.NoError(b, err)
 			for k := 0; k < 5; k++ {
 				fileName := fmt.Sprintf("file%d.txt", k)
 				content := fmt.Sprintf("Content %d-%d", j, k)
@@ -1076,7 +1094,8 @@ func TestExtentTreeConversion(t *testing.T) {
 	// a new block is allocated. When we have >4 non-contiguous extent ranges,
 	// the extent tree must convert from flat to indexed.
 
-	testDir := tc.builder.CreateDirectory(ext4fs.RootInode, "extent_test", 0755, 0, 0)
+	testDir, err := tc.builder.CreateDirectory(ext4fs.RootInode, "extent_test", 0755, 0, 0)
+	require.NoError(t, err)
 
 	// Create many files to force multiple blocks and potential non-contiguous allocation
 	for i := 0; i < 500; i++ {
