@@ -21,8 +21,6 @@ const (
 	dockerImage = "alpine:latest"
 	// Default test image size in MB
 	defaultImageSizeMB = 64
-	// Partition offset (1MB) for mounting
-	partitionOffset = 1048576
 )
 
 // testContext holds resources and state for a single end-to-end test case.
@@ -63,8 +61,9 @@ func newTestContext(t *testing.T, sizeMB int) *testContext {
 // and closes the builder. The image file is then ready for mounting and testing.
 func (tc *testContext) finalize() {
 	tc.t.Helper()
-	tc.builder.FinalizeMetadata()
-	err := tc.builder.Save()
+	err := tc.builder.FinalizeMetadata()
+	require.NoError(tc.t, err, "failed to finalize metadata")
+	err = tc.builder.Save()
 	require.NoError(tc.t, err, "failed to save image")
 	err = tc.builder.Close()
 	require.NoError(tc.t, err, "failed to close builder")
@@ -1086,7 +1085,9 @@ func BenchmarkFilesystemCreation(b *testing.B) {
 			}
 		}
 
-		builder.FinalizeMetadata()
+		if err := builder.FinalizeMetadata(); err != nil {
+			b.Fatal(err)
+		}
 		if err := builder.Save(); err != nil {
 			b.Fatal(err)
 		}

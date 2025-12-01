@@ -131,7 +131,7 @@ func (l *Layout) BlockOffset(blockNum uint32) uint64 {
 // the group's inode table. Inode numbers start from 1.
 func (l *Layout) InodeOffset(inodeNum uint32) uint64 {
 	if inodeNum < 1 {
-		panic(fmt.Sprintf("invalid inode number: %d", inodeNum))
+		panic(fmt.Sprintf("invalid inode number: %d", inodeNum)) // This should never happen in normal operation
 	}
 
 	// Determine which group this inode belongs to

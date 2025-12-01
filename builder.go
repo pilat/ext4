@@ -58,13 +58,27 @@ func (b *Builder) PrepareFilesystem() error {
 		fmt.Println()
 	}
 
-	b.writeMBR()
-	b.writeSuperblock()
-	b.writeGroupDescriptors()
-	b.initBitmaps()
-	b.zeroInodeTables()
-	b.createRootDirectory()
-	b.createLostFound()
+	if err := b.writeMBR(); err != nil {
+		return err
+	}
+	if err := b.writeSuperblock(); err != nil {
+		return err
+	}
+	if err := b.writeGroupDescriptors(); err != nil {
+		return err
+	}
+	if err := b.initBitmaps(); err != nil {
+		return err
+	}
+	if err := b.zeroInodeTables(); err != nil {
+		return err
+	}
+	if err := b.createRootDirectory(); err != nil {
+		return err
+	}
+	if err := b.createLostFound(); err != nil {
+		return err
+	}
 
 	if DEBUG {
 		fmt.Println("✓ Filesystem prepared successfully")
@@ -79,7 +93,7 @@ func (b *Builder) PrepareFilesystem() error {
 // writeMBR writes the Master Boot Record to the first 512 bytes of the disk.
 // The MBR contains the partition table with a single ext4 partition spanning
 // the entire disk. This is required for the disk to be recognized as partitioned.
-func (b *Builder) writeMBR() {
+func (b *Builder) writeMBR() error {
 	mbr := MBR{
 		Signature: MBRSignature,
 	}
@@ -97,19 +111,24 @@ func (b *Builder) writeMBR() {
 	}
 
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.LittleEndian, mbr)
-	b.disk.WriteAt(buf.Bytes(), 0)
+	if err := binary.Write(&buf, binary.LittleEndian, mbr); err != nil {
+		return fmt.Errorf("failed to encode MBR: %w", err)
+	}
+	if _, err := b.disk.WriteAt(buf.Bytes(), 0); err != nil {
+		return fmt.Errorf("failed to write MBR: %w", err)
+	}
 
 	if DEBUG {
 		fmt.Printf("✓ MBR written\n")
 	}
+	return nil
 }
 
 // writeSuperblock writes the ext4 superblock to offset 1024 bytes on disk.
 // The superblock contains global filesystem parameters including block size,
 // inode count, feature flags, and creation timestamp. It serves as the
 // filesystem's "header" containing essential metadata.
-func (b *Builder) writeSuperblock() {
+func (b *Builder) writeSuperblock() error {
 	sb := Superblock{
 		Magic:             Ext4Magic,
 		InodesCount:       b.layout.TotalInodes(),
@@ -160,10 +179,14 @@ func (b *Builder) writeSuperblock() {
 	}
 
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.LittleEndian, sb)
+	if err := binary.Write(&buf, binary.LittleEndian, sb); err != nil {
+		return fmt.Errorf("failed to encode superblock: %w", err)
+	}
 
 	// Write primary superblock at byte 1024
-	b.disk.WriteAt(buf.Bytes(), int64(b.layout.PartitionStart+SuperblockOffset))
+	if _, err := b.disk.WriteAt(buf.Bytes(), int64(b.layout.PartitionStart+SuperblockOffset)); err != nil {
+		return fmt.Errorf("failed to write primary superblock: %w", err)
+	}
 
 	// Write backup superblocks in sparse groups
 	for g := uint32(1); g < b.layout.GroupCount; g++ {
@@ -171,9 +194,13 @@ func (b *Builder) writeSuperblock() {
 			gl := b.layout.GetGroupLayout(g)
 			sb.BlockGroupNr = uint16(g)
 			buf.Reset()
-			binary.Write(&buf, binary.LittleEndian, sb)
+			if err := binary.Write(&buf, binary.LittleEndian, sb); err != nil {
+				return fmt.Errorf("failed to encode backup superblock for group %d: %w", g, err)
+			}
 			// Superblock is at byte 0 of the block, not byte 1024
-			b.disk.WriteAt(buf.Bytes(), int64(b.layout.BlockOffset(gl.SuperblockBlock)))
+			if _, err := b.disk.WriteAt(buf.Bytes(), int64(b.layout.BlockOffset(gl.SuperblockBlock))); err != nil {
+				return fmt.Errorf("failed to write backup superblock for group %d: %w", g, err)
+			}
 		}
 	}
 
@@ -181,13 +208,14 @@ func (b *Builder) writeSuperblock() {
 		fmt.Printf("✓ Superblock written (groups: %d, blocks: %d)\n",
 			b.layout.GroupCount, b.layout.TotalBlocks)
 	}
+	return nil
 }
 
 // writeGroupDescriptors writes the group descriptor table (GDT) after the superblock.
 // Each group descriptor (32 bytes) contains metadata for its block group including
 // locations of bitmaps, inode tables, and usage statistics. The GDT enables
 // efficient parallel operations across multiple block groups.
-func (b *Builder) writeGroupDescriptors() {
+func (b *Builder) writeGroupDescriptors() error {
 	gdt := make([]byte, b.layout.GroupCount*32)
 
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
@@ -211,29 +239,36 @@ func (b *Builder) writeGroupDescriptors() {
 		}
 
 		var buf bytes.Buffer
-		binary.Write(&buf, binary.LittleEndian, gd)
+		if err := binary.Write(&buf, binary.LittleEndian, gd); err != nil {
+			return fmt.Errorf("failed to encode group descriptor for group %d: %w", g, err)
+		}
 		copy(gdt[g*32:], buf.Bytes())
 	}
 
 	gl0 := b.layout.GetGroupLayout(0)
-	b.disk.WriteAt(gdt, int64(b.layout.BlockOffset(gl0.GDTStart)))
+	if _, err := b.disk.WriteAt(gdt, int64(b.layout.BlockOffset(gl0.GDTStart))); err != nil {
+		return fmt.Errorf("failed to write primary group descriptors: %w", err)
+	}
 
 	for g := uint32(1); g < b.layout.GroupCount; g++ {
 		if isSparseGroup(g) {
 			gl := b.layout.GetGroupLayout(g)
-			b.disk.WriteAt(gdt, int64(b.layout.BlockOffset(gl.GDTStart)))
+			if _, err := b.disk.WriteAt(gdt, int64(b.layout.BlockOffset(gl.GDTStart))); err != nil {
+				return fmt.Errorf("failed to write backup group descriptors for group %d: %w", g, err)
+			}
 		}
 	}
 
 	if DEBUG {
 		fmt.Printf("✓ Group descriptors written (%d groups)\n", b.layout.GroupCount)
 	}
+	return nil
 }
 
 // initBitmaps initializes the block and inode bitmaps for all block groups.
 // Block bitmaps track which blocks are allocated, while inode bitmaps track
 // which inodes are in use. Reserved inodes (1-10) are marked as used during initialization.
-func (b *Builder) initBitmaps() {
+func (b *Builder) initBitmaps() error {
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
 		gl := b.layout.GetGroupLayout(g)
 
@@ -250,7 +285,9 @@ func (b *Builder) initBitmaps() {
 			blockBitmap[i/8] |= 1 << (i % 8)
 		}
 
-		b.disk.WriteAt(blockBitmap, int64(b.layout.BlockOffset(gl.BlockBitmapBlock)))
+		if _, err := b.disk.WriteAt(blockBitmap, int64(b.layout.BlockOffset(gl.BlockBitmapBlock))); err != nil {
+			return fmt.Errorf("failed to write block bitmap for group %d: %w", g, err)
+		}
 
 		// Inode bitmap
 		inodeBitmap := make([]byte, BlockSize)
@@ -274,36 +311,45 @@ func (b *Builder) initBitmaps() {
 			}
 		}
 
-		b.disk.WriteAt(inodeBitmap, int64(b.layout.BlockOffset(gl.InodeBitmapBlock)))
+		if _, err := b.disk.WriteAt(inodeBitmap, int64(b.layout.BlockOffset(gl.InodeBitmapBlock))); err != nil {
+			return fmt.Errorf("failed to write inode bitmap for group %d: %w", g, err)
+		}
 	}
 
 	if DEBUG {
 		fmt.Printf("✓ Bitmaps initialized\n")
 	}
+	return nil
 }
 
 // zeroInodeTables initializes all inode table blocks to zero.
 // Inode tables store the actual inode structures for each block group.
 // Zeroing ensures no garbage data remains from previous filesystem states.
-func (b *Builder) zeroInodeTables() {
+func (b *Builder) zeroInodeTables() error {
 	zeroBlock := make([]byte, BlockSize)
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
 		gl := b.layout.GetGroupLayout(g)
 		for i := uint32(0); i < b.layout.InodeTableBlocks; i++ {
-			b.disk.WriteAt(zeroBlock, int64(b.layout.BlockOffset(gl.InodeTableStart+i)))
+			if _, err := b.disk.WriteAt(zeroBlock, int64(b.layout.BlockOffset(gl.InodeTableStart+i))); err != nil {
+				return fmt.Errorf("failed to zero inode table block %d in group %d: %w", i, g, err)
+			}
 		}
 	}
 
 	if DEBUG {
 		fmt.Printf("✓ Inode tables zeroed\n")
 	}
+	return nil
 }
 
 // createRootDirectory creates the root directory (inode 2) with essential entries.
 // The root directory contains "." and ".." entries pointing to itself, and serves
 // as the mount point for the filesystem. It is allocated inode 2 by convention.
-func (b *Builder) createRootDirectory() {
-	dataBlock, _ := b.allocateBlock() // Ошибка невозможна при инициализации
+func (b *Builder) createRootDirectory() error {
+	dataBlock, err := b.allocateBlock()
+	if err != nil {
+		return fmt.Errorf("failed to allocate block for root directory: %w", err)
+	}
 
 	inode := b.makeDirectoryInode(0755, 0, 0)
 	inode.LinksCount = 2
@@ -311,14 +357,20 @@ func (b *Builder) createRootDirectory() {
 	inode.BlocksLo = BlockSize / 512
 	b.setExtent(&inode, 0, dataBlock, 1)
 
-	b.writeInode(RootInode, &inode)
-	b.markInodeUsed(RootInode)
+	if err := b.writeInode(RootInode, &inode); err != nil {
+		return fmt.Errorf("failed to write root inode: %w", err)
+	}
+	if err := b.markInodeUsed(RootInode); err != nil {
+		return fmt.Errorf("failed to mark root inode as used: %w", err)
+	}
 
 	entries := []DirEntry{
 		{Inode: RootInode, Type: FTDir, Name: []byte(".")},
 		{Inode: RootInode, Type: FTDir, Name: []byte("..")},
 	}
-	b.writeDirBlock(dataBlock, entries)
+	if err := b.writeDirBlock(dataBlock, entries); err != nil {
+		return fmt.Errorf("failed to write root directory block: %w", err)
+	}
 
 	// Root inode is always in group 0
 	b.usedDirsPerGroup[0]++
@@ -326,14 +378,21 @@ func (b *Builder) createRootDirectory() {
 	if DEBUG {
 		fmt.Printf("✓ Root directory created\n")
 	}
+	return nil
 }
 
 // createLostFound creates the lost+found directory required by ext4 filesystem standard.
 // This directory is used by fsck and other utilities to store orphaned files
 // and directories found during filesystem recovery operations.
-func (b *Builder) createLostFound() {
-	inodeNum, _ := b.allocateInode()
-	dataBlock, _ := b.allocateBlock()
+func (b *Builder) createLostFound() error {
+	inodeNum, err := b.allocateInode()
+	if err != nil {
+		return fmt.Errorf("failed to allocate inode for lost+found: %w", err)
+	}
+	dataBlock, err := b.allocateBlock()
+	if err != nil {
+		return fmt.Errorf("failed to allocate block for lost+found: %w", err)
+	}
 
 	inode := b.makeDirectoryInode(0700, 0, 0)
 	inode.LinksCount = 2
@@ -341,21 +400,29 @@ func (b *Builder) createLostFound() {
 	inode.BlocksLo = BlockSize / 512
 	b.setExtent(&inode, 0, dataBlock, 1)
 
-	b.writeInode(inodeNum, &inode)
+	if err := b.writeInode(inodeNum, &inode); err != nil {
+		return fmt.Errorf("failed to write lost+found inode: %w", err)
+	}
 
 	entries := []DirEntry{
 		{Inode: inodeNum, Type: FTDir, Name: []byte(".")},
 		{Inode: RootInode, Type: FTDir, Name: []byte("..")},
 	}
-	b.writeDirBlock(dataBlock, entries)
+	if err := b.writeDirBlock(dataBlock, entries); err != nil {
+		return fmt.Errorf("failed to write lost+found directory block: %w", err)
+	}
 
-	b.addDirEntry(RootInode, DirEntry{
+	if err := b.addDirEntry(RootInode, DirEntry{
 		Inode: inodeNum,
 		Type:  FTDir,
 		Name:  []byte("lost+found"),
-	})
+	}); err != nil {
+		return fmt.Errorf("failed to add lost+found entry to root: %w", err)
+	}
 
-	b.incrementLinkCount(RootInode)
+	if err := b.incrementLinkCount(RootInode); err != nil {
+		return fmt.Errorf("failed to increment root link count: %w", err)
+	}
 
 	// Track in correct group
 	group := (inodeNum - 1) / InodesPerGroup
@@ -364,12 +431,13 @@ func (b *Builder) createLostFound() {
 	if DEBUG {
 		fmt.Printf("✓ lost+found created\n")
 	}
+	return nil
 }
 
 // freeBlock marks a block as free in the appropriate block bitmap.
 // This allows previously allocated blocks to be reused for future allocations.
 // The block is added to the free block list for efficient reuse.
-func (b *Builder) freeBlock(blockNum uint32) {
+func (b *Builder) freeBlock(blockNum uint32) error {
 	group := blockNum / BlocksPerGroup
 	indexInGroup := blockNum % BlocksPerGroup
 
@@ -377,13 +445,18 @@ func (b *Builder) freeBlock(blockNum uint32) {
 	offset := b.layout.BlockOffset(gl.BlockBitmapBlock) + uint64(indexInGroup/8)
 
 	var buf [1]byte
-	b.disk.ReadAt(buf[:], int64(offset))
+	if _, err := b.disk.ReadAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("failed to read block bitmap for freeing block %d: %w", blockNum, err)
+	}
 	buf[0] &^= 1 << (indexInGroup % 8) // Clear the bit
-	b.disk.WriteAt(buf[:], int64(offset))
+	if _, err := b.disk.WriteAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("failed to write block bitmap for freeing block %d: %w", blockNum, err)
+	}
 
 	// Track freed blocks for accurate count and reuse
 	b.freedBlocksPerGroup[group]++
 	b.freeBlockList = append(b.freeBlockList, blockNum)
+	return nil
 }
 
 // ============================================================================
@@ -402,7 +475,9 @@ func (b *Builder) allocateBlock() (uint32, error) {
 		group := block / BlocksPerGroup
 		b.freedBlocksPerGroup[group]--
 
-		b.markBlockUsed(block)
+		if err := b.markBlockUsed(block); err != nil {
+			return 0, fmt.Errorf("failed to mark reused block as used: %w", err)
+		}
 		return block, nil
 	}
 
@@ -414,7 +489,9 @@ func (b *Builder) allocateBlock() (uint32, error) {
 		if b.nextBlockPerGroup[g] < groupEnd {
 			block := b.nextBlockPerGroup[g]
 			b.nextBlockPerGroup[g]++
-			b.markBlockUsed(block)
+			if err := b.markBlockUsed(block); err != nil {
+				return 0, fmt.Errorf("failed to mark allocated block as used: %w", err)
+			}
 			return block, nil
 		}
 	}
@@ -440,7 +517,9 @@ func (b *Builder) allocateBlocks(n uint32) ([]uint32, error) {
 		group := block / BlocksPerGroup
 		b.freedBlocksPerGroup[group]--
 
-		b.markBlockUsed(block)
+		if err := b.markBlockUsed(block); err != nil {
+			return nil, fmt.Errorf("failed to mark reused block as used: %w", err)
+		}
 		blocks = append(blocks, block)
 	}
 
@@ -462,7 +541,9 @@ func (b *Builder) allocateBlocks(n uint32) ([]uint32, error) {
 				for i := uint32(0); i < toAlloc; i++ {
 					block := b.nextBlockPerGroup[g]
 					b.nextBlockPerGroup[g]++
-					b.markBlockUsed(block)
+					if err := b.markBlockUsed(block); err != nil {
+						return nil, fmt.Errorf("failed to mark allocated block as used: %w", err)
+					}
 					blocks = append(blocks, block)
 				}
 				found = true
@@ -490,7 +571,9 @@ func (b *Builder) allocateInode() (uint32, error) {
 
 	inode := b.nextInode
 	b.nextInode++
-	b.markInodeUsed(inode)
+	if err := b.markInodeUsed(inode); err != nil {
+		return 0, fmt.Errorf("failed to mark allocated inode as used: %w", err)
+	}
 	return inode, nil
 }
 
@@ -501,7 +584,7 @@ func (b *Builder) allocateInode() (uint32, error) {
 // markBlockUsed marks the specified block as used in its group's block bitmap.
 // This prevents the block from being allocated again until it is explicitly freed.
 // The bitmap is updated on disk to reflect the new allocation state.
-func (b *Builder) markBlockUsed(blockNum uint32) {
+func (b *Builder) markBlockUsed(blockNum uint32) error {
 	group := blockNum / BlocksPerGroup
 	indexInGroup := blockNum % BlocksPerGroup
 
@@ -509,17 +592,22 @@ func (b *Builder) markBlockUsed(blockNum uint32) {
 	offset := b.layout.BlockOffset(gl.BlockBitmapBlock) + uint64(indexInGroup/8)
 
 	var buf [1]byte
-	b.disk.ReadAt(buf[:], int64(offset))
+	if _, err := b.disk.ReadAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("failed to read block bitmap for marking block %d used: %w", blockNum, err)
+	}
 	buf[0] |= 1 << (indexInGroup % 8)
-	b.disk.WriteAt(buf[:], int64(offset))
+	if _, err := b.disk.WriteAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("failed to write block bitmap for marking block %d used: %w", blockNum, err)
+	}
+	return nil
 }
 
 // markInodeUsed marks the specified inode as used in its group's inode bitmap.
 // This prevents the inode from being allocated again and updates the bitmap on disk.
 // Inode 0 is invalid and should never be marked as used.
-func (b *Builder) markInodeUsed(inodeNum uint32) {
+func (b *Builder) markInodeUsed(inodeNum uint32) error {
 	if inodeNum < 1 {
-		return
+		return nil
 	}
 	group := (inodeNum - 1) / InodesPerGroup
 	indexInGroup := (inodeNum - 1) % InodesPerGroup
@@ -528,9 +616,14 @@ func (b *Builder) markInodeUsed(inodeNum uint32) {
 	offset := b.layout.BlockOffset(gl.InodeBitmapBlock) + uint64(indexInGroup/8)
 
 	var buf [1]byte
-	b.disk.ReadAt(buf[:], int64(offset))
+	if _, err := b.disk.ReadAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("failed to read inode bitmap for marking inode %d used: %w", inodeNum, err)
+	}
 	buf[0] |= 1 << (indexInGroup % 8)
-	b.disk.WriteAt(buf[:], int64(offset))
+	if _, err := b.disk.WriteAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("failed to write inode bitmap for marking inode %d used: %w", inodeNum, err)
+	}
+	return nil
 }
 
 // ============================================================================
@@ -678,7 +771,9 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 		binary.LittleEndian.PutUint32(leaf[off+8:], ext.physical)
 	}
 
-	b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock)))
+	if _, err := b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+		return fmt.Errorf("failed to write extent leaf block: %w", err)
+	}
 
 	// Update inode to be index node
 	for i := range inode.Block {
@@ -703,31 +798,46 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 // writeInode writes an inode structure to its designated location in the inode table.
 // Inodes are stored in inode tables within their respective block groups.
 // The inode number determines which group and offset within the table to use.
-func (b *Builder) writeInode(inodeNum uint32, inode *Inode) {
+func (b *Builder) writeInode(inodeNum uint32, inode *Inode) error {
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.LittleEndian, inode)
-	b.disk.WriteAt(buf.Bytes(), int64(b.layout.InodeOffset(inodeNum)))
+	if err := binary.Write(&buf, binary.LittleEndian, inode); err != nil {
+		return fmt.Errorf("failed to encode inode %d: %w", inodeNum, err)
+	}
+	if _, err := b.disk.WriteAt(buf.Bytes(), int64(b.layout.InodeOffset(inodeNum))); err != nil {
+		return fmt.Errorf("failed to write inode %d: %w", inodeNum, err)
+	}
+	return nil
 }
 
 // readInode reads an inode structure from its location in the inode table.
 // Returns a pointer to the inode data, which can be used for reading file metadata
 // or modifying inode attributes. The inode number determines the group and offset.
-func (b *Builder) readInode(inodeNum uint32) *Inode {
+func (b *Builder) readInode(inodeNum uint32) (*Inode, error) {
 	buf := make([]byte, InodeSize)
-	b.disk.ReadAt(buf, int64(b.layout.InodeOffset(inodeNum)))
+	if _, err := b.disk.ReadAt(buf, int64(b.layout.InodeOffset(inodeNum))); err != nil {
+		return nil, fmt.Errorf("failed to read inode %d: %w", inodeNum, err)
+	}
 
 	inode := &Inode{}
-	binary.Read(bytes.NewReader(buf), binary.LittleEndian, inode)
-	return inode
+	if err := binary.Read(bytes.NewReader(buf), binary.LittleEndian, inode); err != nil {
+		return nil, fmt.Errorf("failed to decode inode %d: %w", inodeNum, err)
+	}
+	return inode, nil
 }
 
 // incrementLinkCount increases the hard link count for the specified inode.
 // This is called when a directory entry is added that references the inode,
 // ensuring the link count accurately reflects the number of directory references.
-func (b *Builder) incrementLinkCount(inodeNum uint32) {
-	inode := b.readInode(inodeNum)
+func (b *Builder) incrementLinkCount(inodeNum uint32) error {
+	inode, err := b.readInode(inodeNum)
+	if err != nil {
+		return fmt.Errorf("failed to read inode for link count increment: %w", err)
+	}
 	inode.LinksCount++
-	b.writeInode(inodeNum, inode)
+	if err := b.writeInode(inodeNum, inode); err != nil {
+		return fmt.Errorf("failed to write inode after incrementing link count: %w", err)
+	}
+	return nil
 }
 
 // ============================================================================
@@ -737,7 +847,7 @@ func (b *Builder) incrementLinkCount(inodeNum uint32) {
 // writeDirBlock writes a block containing directory entries to disk.
 // Directory entries are packed into the block with proper record length calculations
 // to ensure correct parsing. The block becomes part of the directory's data extent.
-func (b *Builder) writeDirBlock(blockNum uint32, entries []DirEntry) {
+func (b *Builder) writeDirBlock(blockNum uint32, entries []DirEntry) error {
 	block := make([]byte, BlockSize)
 	offset := 0
 
@@ -761,34 +871,25 @@ func (b *Builder) writeDirBlock(blockNum uint32, entries []DirEntry) {
 		offset += recLen
 	}
 
-	b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum)))
-}
-
-// getInodeDataBlock returns the first data block number for a directory inode.
-// For directories, this is typically the block containing the "." and ".." entries.
-// Used for reading directory contents during operations like adding new entries.
-func (b *Builder) getInodeDataBlock(inodeNum uint32) uint32 {
-	inode := b.readInode(inodeNum)
-	blocks := b.getInodeBlocks(inode)
-	if len(blocks) == 0 {
-		panic(fmt.Sprintf("inode %d has no data blocks", inodeNum))
+	if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+		return fmt.Errorf("failed to write directory block %d: %w", blockNum, err)
 	}
-	return blocks[0]
+	return nil
 }
 
 // getInodeBlocks extracts all block numbers referenced by an inode's extent tree.
 // Parses the extent structures to return a complete list of data blocks allocated
 // to the file or directory. Supports both simple extents and complex extent trees.
-func (b *Builder) getInodeBlocks(inode *Inode) []uint32 {
+func (b *Builder) getInodeBlocks(inode *Inode) ([]uint32, error) {
 	if (inode.Flags & InodeFlagExtents) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	entries := binary.LittleEndian.Uint16(inode.Block[2:4])
 	depth := binary.LittleEndian.Uint16(inode.Block[6:8])
 
 	if entries == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var blocks []uint32
@@ -809,7 +910,9 @@ func (b *Builder) getInodeBlocks(inode *Inode) []uint32 {
 			leafBlock := binary.LittleEndian.Uint32(inode.Block[off+4:])
 
 			leafData := make([]byte, BlockSize)
-			b.disk.ReadAt(leafData, int64(b.layout.BlockOffset(leafBlock)))
+			if _, err := b.disk.ReadAt(leafData, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+				return nil, fmt.Errorf("failed to read extent leaf block %d: %w", leafBlock, err)
+			}
 
 			leafEntries := binary.LittleEndian.Uint16(leafData[2:4])
 			for j := uint16(0); j < leafEntries; j++ {
@@ -824,15 +927,21 @@ func (b *Builder) getInodeBlocks(inode *Inode) []uint32 {
 		}
 	}
 
-	return blocks
+	return blocks, nil
 }
 
 // addDirEntry adds a new directory entry to the specified directory.
 // Searches existing directory blocks for space, or allocates new blocks if needed.
 // Updates the directory's size and block allocation as entries are added.
 func (b *Builder) addDirEntry(dirInode uint32, entry DirEntry) error {
-	inode := b.readInode(dirInode)
-	dataBlocks := b.getInodeBlocks(inode)
+	inode, err := b.readInode(dirInode)
+	if err != nil {
+		return fmt.Errorf("failed to read directory inode: %w", err)
+	}
+	dataBlocks, err := b.getInodeBlocks(inode)
+	if err != nil {
+		return fmt.Errorf("failed to get directory blocks: %w", err)
+	}
 
 	newNameLen := len(entry.Name)
 	newRecLen := 8 + newNameLen
@@ -841,7 +950,9 @@ func (b *Builder) addDirEntry(dirInode uint32, entry DirEntry) error {
 	}
 
 	for _, blockNum := range dataBlocks {
-		if b.tryAddEntryToBlock(blockNum, entry, newRecLen) {
+		if success, err := b.tryAddEntryToBlock(blockNum, entry, newRecLen); err != nil {
+			return fmt.Errorf("failed to add entry to directory block %d: %w", blockNum, err)
+		} else if success {
 			return nil
 		}
 	}
@@ -863,12 +974,19 @@ func (b *Builder) addDirEntry(dirInode uint32, entry DirEntry) error {
 	block[7] = entry.Type
 	copy(block[8:], entry.Name)
 
-	b.disk.WriteAt(block, int64(b.layout.BlockOffset(newBlock)))
+	if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(newBlock))); err != nil {
+		return fmt.Errorf("failed to write directory block: %w", err)
+	}
 
-	inode = b.readInode(dirInode)
+	inode, err = b.readInode(dirInode)
+	if err != nil {
+		return fmt.Errorf("failed to re-read directory inode: %w", err)
+	}
 	inode.SizeLo += BlockSize
 	inode.BlocksLo += BlockSize / 512
-	b.writeInode(dirInode, inode)
+	if err := b.writeInode(dirInode, inode); err != nil {
+		return fmt.Errorf("failed to update directory inode: %w", err)
+	}
 
 	return nil
 }
@@ -876,9 +994,11 @@ func (b *Builder) addDirEntry(dirInode uint32, entry DirEntry) error {
 // tryAddEntryToBlock attempts to add a directory entry to an existing directory block.
 // Returns true if the entry fits in the available space, false if the block is full.
 // Calculates proper record lengths to maintain directory entry structure integrity.
-func (b *Builder) tryAddEntryToBlock(blockNum uint32, entry DirEntry, newRecLen int) bool {
+func (b *Builder) tryAddEntryToBlock(blockNum uint32, entry DirEntry, newRecLen int) (bool, error) {
 	block := make([]byte, BlockSize)
-	b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum)))
+	if _, err := b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+		return false, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
+	}
 
 	offset := 0
 	lastOffset := 0
@@ -900,7 +1020,7 @@ func (b *Builder) tryAddEntryToBlock(blockNum uint32, entry DirEntry, newRecLen 
 
 	spaceAvailable := lastRecLen - lastActualSize
 	if spaceAvailable < newRecLen {
-		return false
+		return false, nil
 	}
 
 	binary.LittleEndian.PutUint16(block[lastOffset+4:], uint16(lastActualSize))
@@ -914,15 +1034,20 @@ func (b *Builder) tryAddEntryToBlock(blockNum uint32, entry DirEntry, newRecLen 
 	block[newOffset+7] = entry.Type
 	copy(block[newOffset+8:], entry.Name)
 
-	b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum)))
-	return true
+	if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+		return false, fmt.Errorf("failed to write directory block %d: %w", blockNum, err)
+	}
+	return true, nil
 }
 
 // addBlockToInode adds a new block to a directory inode's extent tree.
 // Used when a directory grows beyond its current block allocation.
 // May convert from simple extents to indexed extents for large directories.
 func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
-	inode := b.readInode(inodeNum)
+	inode, err := b.readInode(inodeNum)
+	if err != nil {
+		return fmt.Errorf("failed to read inode for block addition: %w", err)
+	}
 
 	entries := binary.LittleEndian.Uint16(inode.Block[2:4])
 	maxEntries := binary.LittleEndian.Uint16(inode.Block[4:6])
@@ -938,7 +1063,9 @@ func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
 		binary.LittleEndian.PutUint16(inode.Block[16:], 1)
 		binary.LittleEndian.PutUint16(inode.Block[18:], 0)
 		binary.LittleEndian.PutUint32(inode.Block[20:], newBlock)
-		b.writeInode(inodeNum, inode)
+		if err := b.writeInode(inodeNum, inode); err != nil {
+			return fmt.Errorf("failed to write inode after initializing extent: %w", err)
+		}
 		return nil
 	}
 
@@ -949,7 +1076,9 @@ func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
 
 	if lastStart+uint32(lastLen) == newBlock && lastLen < 32768 {
 		binary.LittleEndian.PutUint16(inode.Block[lastOff+4:], lastLen+1)
-		b.writeInode(inodeNum, inode)
+		if err := b.writeInode(inodeNum, inode); err != nil {
+			return fmt.Errorf("failed to write inode after extending extent: %w", err)
+		}
 		return nil
 	}
 
@@ -966,7 +1095,9 @@ func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
 	binary.LittleEndian.PutUint32(inode.Block[newOff+8:], newBlock)
 
 	binary.LittleEndian.PutUint16(inode.Block[2:4], entries+1)
-	b.writeInode(inodeNum, inode)
+	if err := b.writeInode(inodeNum, inode); err != nil {
+		return fmt.Errorf("failed to write inode after adding extent entry: %w", err)
+	}
 	return nil
 }
 
@@ -974,7 +1105,10 @@ func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
 // Creates an extent index block to manage multiple extents efficiently.
 // Required when a file or directory exceeds the capacity of inline extent storage.
 func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
-	inode := b.readInode(inodeNum)
+	inode, err := b.readInode(inodeNum)
+	if err != nil {
+		return fmt.Errorf("failed to read inode for extent conversion: %w", err)
+	}
 	entries := binary.LittleEndian.Uint16(inode.Block[2:4])
 
 	leafBlock, err := b.allocateBlock()
@@ -1001,7 +1135,9 @@ func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 	binary.LittleEndian.PutUint16(leaf[newOff+6:], 0)
 	binary.LittleEndian.PutUint32(leaf[newOff+8:], newBlock)
 
-	b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock)))
+	if _, err := b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+		return fmt.Errorf("failed to write extent leaf block: %w", err)
+	}
 
 	for i := range inode.Block {
 		inode.Block[i] = 0
@@ -1018,7 +1154,9 @@ func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 
 	inode.BlocksLo += BlockSize / 512
 
-	b.writeInode(inodeNum, inode)
+	if err := b.writeInode(inodeNum, inode); err != nil {
+		return fmt.Errorf("failed to write inode after converting to indexed extents: %w", err)
+	}
 	return nil
 }
 
@@ -1026,12 +1164,17 @@ func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 // Updates the extent index structure to include the new extent mapping.
 // Handles the complexity of maintaining sorted extent indices.
 func (b *Builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
-	inode := b.readInode(inodeNum)
+	inode, err := b.readInode(inodeNum)
+	if err != nil {
+		return fmt.Errorf("failed to read indexed inode: %w", err)
+	}
 
 	leafBlock := binary.LittleEndian.Uint32(inode.Block[16:])
 
 	leaf := make([]byte, BlockSize)
-	b.disk.ReadAt(leaf, int64(b.layout.BlockOffset(leafBlock)))
+	if _, err := b.disk.ReadAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+		return fmt.Errorf("failed to read extent leaf block: %w", err)
+	}
 
 	entries := binary.LittleEndian.Uint16(leaf[2:4])
 	maxEntries := binary.LittleEndian.Uint16(leaf[4:6])
@@ -1043,7 +1186,9 @@ func (b *Builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
 
 	if lastStart+uint32(lastLen) == newBlock && lastLen < 32768 {
 		binary.LittleEndian.PutUint16(leaf[lastOff+4:], lastLen+1)
-		b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock)))
+		if _, err := b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+			return fmt.Errorf("failed to write updated extent leaf: %w", err)
+		}
 		return nil
 	}
 
@@ -1060,20 +1205,30 @@ func (b *Builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
 	binary.LittleEndian.PutUint32(leaf[newOff+8:], newBlock)
 
 	binary.LittleEndian.PutUint16(leaf[2:4], entries+1)
-	b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock)))
+	if _, err := b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+		return fmt.Errorf("failed to write new extent leaf: %w", err)
+	}
 	return nil
 }
 
 // findEntry searches for a directory entry with the specified name.
 // Returns the inode number if found, or 0 if the entry doesn't exist.
 // Used to check for existing files before creation or overwriting.
-func (b *Builder) findEntry(dirInode uint32, name string) uint32 {
-	inode := b.readInode(dirInode)
-	dataBlocks := b.getInodeBlocks(inode)
+func (b *Builder) findEntry(dirInode uint32, name string) (uint32, error) {
+	inode, err := b.readInode(dirInode)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read directory inode for entry search: %w", err)
+	}
+	dataBlocks, err := b.getInodeBlocks(inode)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get directory blocks for entry search: %w", err)
+	}
 
 	for _, blockNum := range dataBlocks {
 		block := make([]byte, BlockSize)
-		b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum)))
+		if _, err := b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+			return 0, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
+		}
 
 		offset := 0
 		for offset < BlockSize {
@@ -1086,14 +1241,14 @@ func (b *Builder) findEntry(dirInode uint32, name string) uint32 {
 			entryName := string(block[offset+8 : offset+8+nameLen])
 
 			if entryName == name {
-				return binary.LittleEndian.Uint32(block[offset:])
+				return binary.LittleEndian.Uint32(block[offset:]), nil
 			}
 
 			offset += int(recLen)
 		}
 	}
 
-	return 0
+	return 0, nil
 }
 
 // parseXattrName parses an extended attribute name into its namespace index and short name.
@@ -1154,17 +1309,27 @@ func xattrIndexToPrefix(index uint8) string {
 // Returns the inode number (same as input) on success.
 func (b *Builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid uint16) (uint32, error) {
 	// Read existing inode to get its blocks
-	oldInode := b.readInode(inodeNum)
+	oldInode, err := b.readInode(inodeNum)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read inode for overwrite: %w", err)
+	}
 
 	// Free the xattr block if present
 	if oldInode.FileACLLo != 0 {
-		b.freeBlock(oldInode.FileACLLo)
+		if err := b.freeBlock(oldInode.FileACLLo); err != nil {
+			return 0, fmt.Errorf("failed to free xattr block during overwrite: %w", err)
+		}
 	}
 
 	// Free the old blocks
-	oldBlocks := b.getInodeBlocks(oldInode)
+	oldBlocks, err := b.getInodeBlocks(oldInode)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get old inode blocks during overwrite: %w", err)
+	}
 	for _, blk := range oldBlocks {
-		b.freeBlock(blk)
+		if err := b.freeBlock(blk); err != nil {
+			return 0, fmt.Errorf("failed to free old block %d during overwrite: %w", blk, err)
+		}
 	}
 
 	// If the old inode had an extent tree (depth > 0), free the index blocks too
@@ -1175,7 +1340,9 @@ func (b *Builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid 
 			for i := uint16(0); i < entries && i < 4; i++ {
 				off := 12 + i*12
 				leafBlock := binary.LittleEndian.Uint32(oldInode.Block[off+4:])
-				b.freeBlock(leafBlock)
+				if err := b.freeBlock(leafBlock); err != nil {
+					return 0, fmt.Errorf("failed to free extent leaf block %d during overwrite: %w", leafBlock, err)
+				}
 			}
 		}
 	}
@@ -1212,10 +1379,14 @@ func (b *Builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid 
 		if start < size {
 			copy(block, content[start:end])
 		}
-		b.disk.WriteAt(block, int64(b.layout.BlockOffset(blk)))
+		if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(blk))); err != nil {
+			return 0, fmt.Errorf("failed to write file block %d: %w", blk, err)
+		}
 	}
 
-	b.writeInode(inodeNum, &inode)
+	if err := b.writeInode(inodeNum, &inode); err != nil {
+		return 0, err
+	}
 
 	return inodeNum, nil
 }
@@ -1295,20 +1466,24 @@ func (b *Builder) writeXattrBlock(blockNum uint32, entries []XattrEntry) error {
 	binary.LittleEndian.PutUint32(block[12:16], blockHash) // hash
 	// checksum at 16:20, reserved at 20:32 - leave as zero
 
-	b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum)))
+	if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+		return fmt.Errorf("failed to write xattr block %d: %w", blockNum, err)
+	}
 	return nil
 }
 
 // readXattrBlock reads extended attribute entries from a dedicated block.
 // Parses the special xattr block format to extract name-value pairs.
 // Returns a slice of XattrEntry structures for further processing.
-func (b *Builder) readXattrBlock(blockNum uint32) []XattrEntry {
+func (b *Builder) readXattrBlock(blockNum uint32) ([]XattrEntry, error) {
 	block := make([]byte, BlockSize)
-	b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum)))
+	if _, err := b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+		return nil, fmt.Errorf("failed to read xattr block %d: %w", blockNum, err)
+	}
 
 	magic := binary.LittleEndian.Uint32(block[0:4])
 	if magic != XattrMagic {
-		return nil
+		return nil, nil
 	}
 
 	var entries []XattrEntry
@@ -1351,7 +1526,7 @@ func (b *Builder) readXattrBlock(blockNum uint32) []XattrEntry {
 		offset += entrySize
 	}
 
-	return entries
+	return entries, nil
 }
 
 // xattrEntryHash calculates a hash for an extended attribute entry.

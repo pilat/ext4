@@ -40,21 +40,29 @@ func (b *Builder) CreateDirectory(parentInode uint32, name string, mode, uid, gi
 	inode.BlocksLo = BlockSize / 512
 	b.setExtent(&inode, 0, dataBlock, 1)
 
-	b.writeInode(inodeNum, &inode)
+	if err := b.writeInode(inodeNum, &inode); err != nil {
+		return 0, err
+	}
 
 	entries := []DirEntry{
 		{Inode: inodeNum, Type: FTDir, Name: []byte(".")},
 		{Inode: parentInode, Type: FTDir, Name: []byte("..")},
 	}
-	b.writeDirBlock(dataBlock, entries)
+	if err := b.writeDirBlock(dataBlock, entries); err != nil {
+		return 0, err
+	}
 
-	b.addDirEntry(parentInode, DirEntry{
+	if err := b.addDirEntry(parentInode, DirEntry{
 		Inode: inodeNum,
 		Type:  FTDir,
 		Name:  []byte(name),
-	})
+	}); err != nil {
+		return 0, err
+	}
 
-	b.incrementLinkCount(parentInode)
+	if err := b.incrementLinkCount(parentInode); err != nil {
+		return 0, err
+	}
 
 	// Track directory in correct group
 	group := (inodeNum - 1) / InodesPerGroup
@@ -76,7 +84,10 @@ func (b *Builder) CreateFile(parentInode uint32, name string, content []byte, mo
 		return 0, fmt.Errorf("invalid file name: %w", err)
 	}
 
-	existingInode := b.findEntry(parentInode, name)
+	existingInode, err := b.findEntry(parentInode, name)
+	if err != nil {
+		return 0, fmt.Errorf("failed to check for existing file: %w", err)
+	}
 	if existingInode != 0 {
 		return b.overwriteFile(existingInode, content, mode, uid, gid)
 	}
@@ -119,16 +130,22 @@ func (b *Builder) CreateFile(parentInode uint32, name string, content []byte, mo
 		if start < size {
 			copy(block, content[start:end])
 		}
-		b.disk.WriteAt(block, int64(b.layout.BlockOffset(blk)))
+		if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(blk))); err != nil {
+			return 0, fmt.Errorf("failed to write file block %d: %w", blk, err)
+		}
 	}
 
-	b.writeInode(inodeNum, &inode)
+	if err := b.writeInode(inodeNum, &inode); err != nil {
+		return 0, err
+	}
 
-	b.addDirEntry(parentInode, DirEntry{
+	if err := b.addDirEntry(parentInode, DirEntry{
 		Inode: inodeNum,
 		Type:  FTRegFile,
 		Name:  []byte(name),
-	})
+	}); err != nil {
+		return 0, err
+	}
 
 	if b.debug {
 		fmt.Printf("✓ Created file: %s (inode %d, size %d)\n", name, inodeNum, size)
@@ -189,16 +206,22 @@ func (b *Builder) CreateSymlink(parentInode uint32, name, target string, uid, gi
 
 		block := make([]byte, BlockSize)
 		copy(block, target)
-		b.disk.WriteAt(block, int64(b.layout.BlockOffset(dataBlock)))
+		if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(dataBlock))); err != nil {
+			return 0, fmt.Errorf("failed to write symlink target block: %w", err)
+		}
 	}
 
-	b.writeInode(inodeNum, &inode)
+	if err := b.writeInode(inodeNum, &inode); err != nil {
+		return 0, err
+	}
 
-	b.addDirEntry(parentInode, DirEntry{
+	if err := b.addDirEntry(parentInode, DirEntry{
 		Inode: inodeNum,
 		Type:  FTSymlink,
 		Name:  []byte(name),
-	})
+	}); err != nil {
+		return 0, err
+	}
 
 	if b.debug {
 		fmt.Printf("✓ Created symlink: %s -> %s\n", name, target)
@@ -225,14 +248,21 @@ func (b *Builder) SetXattr(inodeNum uint32, name string, value []byte) error {
 		return fmt.Errorf("xattr name too long: %d > 255", len(shortName))
 	}
 
-	inode := b.readInode(inodeNum)
+	inode, err := b.readInode(inodeNum)
+	if err != nil {
+		return fmt.Errorf("failed to read inode for xattr: %w", err)
+	}
 
 	var xattrBlock uint32
 	var entries []XattrEntry
 
 	if inode.FileACLLo != 0 {
 		xattrBlock = inode.FileACLLo
-		entries = b.readXattrBlock(xattrBlock)
+		var err error
+		entries, err = b.readXattrBlock(xattrBlock)
+		if err != nil {
+			return fmt.Errorf("failed to read existing xattr block: %w", err)
+		}
 	} else {
 		var err error
 		xattrBlock, err = b.allocateBlock()
@@ -264,7 +294,9 @@ func (b *Builder) SetXattr(inodeNum uint32, name string, value []byte) error {
 		return err
 	}
 
-	b.writeInode(inodeNum, inode)
+	if err := b.writeInode(inodeNum, inode); err != nil {
+		return fmt.Errorf("failed to write inode after xattr update: %w", err)
+	}
 
 	if b.debug {
 		fmt.Printf("✓ Set xattr %s on inode %d (%d bytes)\n", name, inodeNum, len(value))
@@ -282,12 +314,18 @@ func (b *Builder) GetXattr(inodeNum uint32, name string) ([]byte, error) {
 		return nil, err
 	}
 
-	inode := b.readInode(inodeNum)
+	inode, err := b.readInode(inodeNum)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read inode for xattr: %w", err)
+	}
 	if inode.FileACLLo == 0 {
 		return nil, fmt.Errorf("no xattrs on inode %d", inodeNum)
 	}
 
-	entries := b.readXattrBlock(inode.FileACLLo)
+	entries, err := b.readXattrBlock(inode.FileACLLo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read xattr block: %w", err)
+	}
 	for _, e := range entries {
 		if e.NameIndex == nameIndex && e.Name == shortName {
 			return e.Value, nil
@@ -301,12 +339,18 @@ func (b *Builder) GetXattr(inodeNum uint32, name string) ([]byte, error) {
 // The returned names include their namespace prefixes (e.g., "user.attr", "trusted.security").
 // Returns an empty slice if the inode has no extended attributes.
 func (b *Builder) ListXattrs(inodeNum uint32) ([]string, error) {
-	inode := b.readInode(inodeNum)
+	inode, err := b.readInode(inodeNum)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read inode for xattr listing: %w", err)
+	}
 	if inode.FileACLLo == 0 {
 		return nil, nil
 	}
 
-	entries := b.readXattrBlock(inode.FileACLLo)
+	entries, err := b.readXattrBlock(inode.FileACLLo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read xattr block: %w", err)
+	}
 	names := make([]string, 0, len(entries))
 
 	for _, e := range entries {
@@ -326,12 +370,18 @@ func (b *Builder) RemoveXattr(inodeNum uint32, name string) error {
 		return err
 	}
 
-	inode := b.readInode(inodeNum)
+	inode, err := b.readInode(inodeNum)
+	if err != nil {
+		return fmt.Errorf("failed to read inode for xattr removal: %w", err)
+	}
 	if inode.FileACLLo == 0 {
 		return fmt.Errorf("no xattrs on inode %d", inodeNum)
 	}
 
-	entries := b.readXattrBlock(inode.FileACLLo)
+	entries, err := b.readXattrBlock(inode.FileACLLo)
+	if err != nil {
+		return fmt.Errorf("failed to read xattr block: %w", err)
+	}
 	newEntries := make([]XattrEntry, 0, len(entries))
 	found := false
 
@@ -349,7 +399,9 @@ func (b *Builder) RemoveXattr(inodeNum uint32, name string) error {
 
 	if len(newEntries) == 0 {
 		// Free the xattr block
-		b.freeBlock(inode.FileACLLo)
+		if err := b.freeBlock(inode.FileACLLo); err != nil {
+			return fmt.Errorf("failed to free xattr block during removal: %w", err)
+		}
 		inode.FileACLLo = 0
 		inode.BlocksLo -= BlockSize / 512
 	} else {
@@ -358,7 +410,9 @@ func (b *Builder) RemoveXattr(inodeNum uint32, name string) error {
 		}
 	}
 
-	b.writeInode(inodeNum, inode)
+	if err := b.writeInode(inodeNum, inode); err != nil {
+		return fmt.Errorf("failed to write inode after xattr removal: %w", err)
+	}
 	return nil
 }
 
@@ -366,7 +420,7 @@ func (b *Builder) RemoveXattr(inodeNum uint32, name string) error {
 // This includes recalculating block and inode usage statistics per group,
 // updating group descriptors with accurate counts, and ensuring the superblock
 // reflects the current filesystem state. Must be called after all file operations.
-func (b *Builder) FinalizeMetadata() {
+func (b *Builder) FinalizeMetadata() error {
 	// Calculate per-group statistics
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
 		gl := b.layout.GetGroupLayout(g)
@@ -409,7 +463,9 @@ func (b *Builder) FinalizeMetadata() {
 		// Read current group descriptor
 		gdOffset := b.layout.BlockOffset(b.layout.GetGroupLayout(0).GDTStart) + uint64(g*32)
 		gdBuf := make([]byte, 32)
-		b.disk.ReadAt(gdBuf, int64(gdOffset))
+		if _, err := b.disk.ReadAt(gdBuf, int64(gdOffset)); err != nil {
+			return fmt.Errorf("failed to read group descriptor for group %d: %w", g, err)
+		}
 
 		// Update fields
 		binary.LittleEndian.PutUint16(gdBuf[12:14], uint16(freeBlocks))
@@ -421,14 +477,18 @@ func (b *Builder) FinalizeMetadata() {
 		// ItableUnusedLo at offset 28
 		binary.LittleEndian.PutUint16(gdBuf[28:30], itableUnused)
 
-		b.disk.WriteAt(gdBuf, int64(gdOffset))
+		if _, err := b.disk.WriteAt(gdBuf, int64(gdOffset)); err != nil {
+			return fmt.Errorf("failed to write group descriptor for group %d: %w", g, err)
+		}
 
 		// Update backup GDTs
 		for bg := uint32(1); bg < b.layout.GroupCount; bg++ {
 			if isSparseGroup(bg) {
 				backupGl := b.layout.GetGroupLayout(bg)
 				backupOffset := b.layout.BlockOffset(backupGl.GDTStart) + uint64(g*32)
-				b.disk.WriteAt(gdBuf, int64(backupOffset))
+				if _, err := b.disk.WriteAt(gdBuf, int64(backupOffset)); err != nil {
+					return fmt.Errorf("failed to write backup group descriptor for group %d: %w", bg, err)
+				}
 			}
 		}
 	}
@@ -446,22 +506,30 @@ func (b *Builder) FinalizeMetadata() {
 	// Update primary superblock
 	sbOffset := b.layout.PartitionStart + SuperblockOffset
 	sbBuf := make([]byte, 1024)
-	b.disk.ReadAt(sbBuf, int64(sbOffset))
+	if _, err := b.disk.ReadAt(sbBuf, int64(sbOffset)); err != nil {
+		return fmt.Errorf("failed to read primary superblock: %w", err)
+	}
 
 	binary.LittleEndian.PutUint32(sbBuf[0x0C:0x10], totalFreeBlocks)
 	binary.LittleEndian.PutUint32(sbBuf[0x10:0x14], totalFreeInodes)
 
-	b.disk.WriteAt(sbBuf, int64(sbOffset))
+	if _, err := b.disk.WriteAt(sbBuf, int64(sbOffset)); err != nil {
+		return fmt.Errorf("failed to write primary superblock: %w", err)
+	}
 
 	// Update backup superblocks
 	for g := uint32(1); g < b.layout.GroupCount; g++ {
 		if isSparseGroup(g) {
 			gl := b.layout.GetGroupLayout(g)
 			backupSbOffset := b.layout.BlockOffset(gl.SuperblockBlock)
-			b.disk.ReadAt(sbBuf, int64(backupSbOffset))
+			if _, err := b.disk.ReadAt(sbBuf, int64(backupSbOffset)); err != nil {
+				return fmt.Errorf("failed to read backup superblock for group %d: %w", g, err)
+			}
 			binary.LittleEndian.PutUint32(sbBuf[0x0C:0x10], totalFreeBlocks)
 			binary.LittleEndian.PutUint32(sbBuf[0x10:0x14], totalFreeInodes)
-			b.disk.WriteAt(sbBuf, int64(backupSbOffset))
+			if _, err := b.disk.WriteAt(sbBuf, int64(backupSbOffset)); err != nil {
+				return fmt.Errorf("failed to write backup superblock for group %d: %w", g, err)
+			}
 		}
 	}
 
@@ -469,4 +537,5 @@ func (b *Builder) FinalizeMetadata() {
 		fmt.Printf("✓ Metadata finalized: %d free blocks, %d free inodes\n",
 			totalFreeBlocks, totalFreeInodes)
 	}
+	return nil
 }

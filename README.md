@@ -71,53 +71,6 @@ func main() {
 }
 ```
 
-## API Overview
-
-### Creating Filesystems
-
-- `NewExt4ImageBuilder(path, sizeMB)` - Create a new ext4 image builder
-- `PrepareFilesystem()` - Initialize the filesystem structure
-- `FinalizeMetadata()` - Update filesystem metadata before saving
-- `Save()` - Write the image to disk
-
-### File Operations
-
-- `CreateDirectory(parent, name, mode, uid, gid)` - Create a directory
-- `CreateFile(parent, name, content, mode, uid, gid)` - Create a file with content
-- `CreateSymlink(parent, name, target, uid, gid)` - Create a symbolic link
-
-### Extended Attributes
-
-- `SetXattr(inode, name, value)` - Set an extended attribute
-- `GetXattr(inode, name)` - Get an extended attribute value
-- `ListXattrs(inode)` - List all extended attributes
-- `RemoveXattr(inode, name)` - Remove an extended attribute
-
-## Mounting and Testing
-
-The created images can be mounted on Linux systems:
-
-```bash
-# Mount the ext4 partition (skip 1MB MBR offset)
-sudo mount -o loop,offset=1048576 disk.img /mnt
-```
-
-For testing, the package includes end-to-end tests that use Docker to mount and verify the generated filesystems.
-
-## Requirements
-
-- Go 1.19 or later
-- Linux for mounting (optional, for testing)
-
-## Contributing
-
-Contributions are welcome! Please ensure:
-
-- Code follows Go conventions
-- Tests pass (`go test`)
-- New features include appropriate tests
-- Documentation is updated
-
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.

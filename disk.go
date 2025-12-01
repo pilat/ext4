@@ -22,10 +22,32 @@ type fileBackend struct {
 	f *os.File
 }
 
-func (fb *fileBackend) ReadAt(p []byte, off int64) (int, error)  { return fb.f.ReadAt(p, off) }
-func (fb *fileBackend) WriteAt(p []byte, off int64) (int, error) { return fb.f.WriteAt(p, off) }
-func (fb *fileBackend) Sync() error                              { return fb.f.Sync() }
-func (fb *fileBackend) Close() error                             { return fb.f.Close() }
+func (fb *fileBackend) ReadAt(p []byte, off int64) (int, error) {
+	n, err := fb.f.ReadAt(p, off)
+	if err != nil {
+		return n, fmt.Errorf("disk read error: %w", err)
+	}
+	return n, nil
+}
+func (fb *fileBackend) WriteAt(p []byte, off int64) (int, error) {
+	n, err := fb.f.WriteAt(p, off)
+	if err != nil {
+		return n, fmt.Errorf("disk write error: %w", err)
+	}
+	return n, nil
+}
+func (fb *fileBackend) Sync() error {
+	if err := fb.f.Sync(); err != nil {
+		return fmt.Errorf("disk sync error: %w", err)
+	}
+	return nil
+}
+func (fb *fileBackend) Close() error {
+	if err := fb.f.Close(); err != nil {
+		return fmt.Errorf("disk close error: %w", err)
+	}
+	return nil
+}
 
 // Ext4ImageBuilder provides the public API for creating ext4 filesystem images.
 // It wraps the internal Builder with file-based storage and provides high-level
@@ -53,19 +75,19 @@ func NewExt4ImageBuilder(imagePath string, sizeMB int) (*Ext4ImageBuilder, error
 	dir := filepath.Dir(imagePath)
 	if dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
 
 	// Create/truncate file
 	f, err := os.OpenFile(imagePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open image file %s: %w", imagePath, err)
 	}
 
 	if err := f.Truncate(int64(totalSize)); err != nil {
 		f.Close()
-		return nil, err
+		return nil, fmt.Errorf("failed to truncate image file: %w", err)
 	}
 
 	backend := &fileBackend{f: f}
@@ -88,8 +110,8 @@ func NewExt4ImageBuilder(imagePath string, sizeMB int) (*Ext4ImageBuilder, error
 // This includes writing the MBR, superblock, group descriptors, bitmaps,
 // inode tables, and creating essential directories. Must be called before
 // any file or directory creation operations.
-func (e *Ext4ImageBuilder) PrepareFilesystem() {
-	e.builder.PrepareFilesystem()
+func (e *Ext4ImageBuilder) PrepareFilesystem() error {
+	return e.builder.PrepareFilesystem()
 }
 
 // CreateDirectory creates a new directory under the specified parent directory.
@@ -143,8 +165,8 @@ func (e *Ext4ImageBuilder) RemoveXattr(inodeNum uint32, name string) error {
 // This includes recalculating block and inode usage statistics,
 // updating group descriptors, and ensuring the superblock is current.
 // Must be called after all file operations are complete.
-func (e *Ext4ImageBuilder) FinalizeMetadata() {
-	e.builder.FinalizeMetadata()
+func (e *Ext4ImageBuilder) FinalizeMetadata() error {
+	return e.builder.FinalizeMetadata()
 }
 
 // Save synchronizes all pending writes to the underlying storage.
