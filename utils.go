@@ -23,29 +23,6 @@ func isSparseGroup(group uint32) bool {
 	return false
 }
 
-// lbaToCHS converts Logical Block Addressing to Cylinder-Head-Sector format.
-// This is used in the MBR partition table for legacy BIOS compatibility.
-// The conversion is simplified and not used for actual disk access.
-func lbaToCHS(lba uint32) [3]byte {
-	sectorsPerTrack := uint32(63)
-	heads := uint32(255)
-
-	sector := (lba % sectorsPerTrack) + 1
-	temp := lba / sectorsPerTrack
-	head := temp % heads
-	cylinder := temp / heads
-
-	if cylinder > 1023 {
-		cylinder = 1023
-	}
-
-	return [3]byte{
-		byte(head),
-		byte((sector & 0x3F) | ((cylinder >> 2) & 0xC0)),
-		byte(cylinder & 0xFF),
-	}
-}
-
 // validateName checks if a filename is valid for use in an ext4 filesystem.
 // Enforces ext4 naming restrictions including length limits, forbidden characters,
 // and reserved names. Used before creating files or directories.

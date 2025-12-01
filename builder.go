@@ -46,7 +46,7 @@ func newBuilder(disk diskBackend, layout *Layout) *Builder {
 }
 
 // PrepareFilesystem initializes the complete ext4 filesystem structure.
-// This includes writing the MBR, superblock, group descriptors, initializing
+// This includes writing the superblock, group descriptors, initializing
 // bitmaps, zeroing inode tables, and creating essential directories like
 // root and lost+found. This method must be called before any file operations.
 func (b *Builder) PrepareFilesystem() error {
@@ -55,9 +55,6 @@ func (b *Builder) PrepareFilesystem() error {
 		fmt.Println()
 	}
 
-	if err := b.writeMBR(); err != nil {
-		return err
-	}
 	if err := b.writeSuperblock(); err != nil {
 		return err
 	}

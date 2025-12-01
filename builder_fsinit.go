@@ -6,40 +6,6 @@ import (
 	"fmt"
 )
 
-// writeMBR writes the Master Boot Record to the first 512 bytes of the disk.
-// The MBR contains the partition table with a single ext4 partition spanning
-// the entire disk. This is required for the disk to be recognized as partitioned.
-func (b *Builder) writeMBR() error {
-	mbr := MBR{
-		Signature: MBRSignature,
-	}
-
-	startLBA := uint32(b.layout.PartitionStart / SectorSize)
-	sizeLBA := uint32(b.layout.PartitionSize / SectorSize)
-
-	mbr.Partitions[0] = MBRPartition{
-		BootIndicator: 0x00,
-		PartType:      0x83,
-		StartLBA:      startLBA,
-		SizeLBA:       sizeLBA,
-		StartCHS:      lbaToCHS(startLBA),
-		EndCHS:        lbaToCHS(startLBA + sizeLBA - 1),
-	}
-
-	var buf bytes.Buffer
-	if err := binary.Write(&buf, binary.LittleEndian, mbr); err != nil {
-		return fmt.Errorf("failed to encode MBR: %w", err)
-	}
-	if _, err := b.disk.WriteAt(buf.Bytes(), 0); err != nil {
-		return fmt.Errorf("failed to write MBR: %w", err)
-	}
-
-	if b.debug {
-		fmt.Printf("✓ MBR written\n")
-	}
-	return nil
-}
-
 // writeSuperblock writes the ext4 superblock to offset 1024 bytes on disk.
 // The superblock contains global filesystem parameters including block size,
 // inode count, feature flags, and creation timestamp. It serves as the

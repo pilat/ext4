@@ -68,7 +68,9 @@ func New(imagePath string, sizeMB int) (*Ext4ImageBuilder, error) {
 	}
 
 	totalSize := uint64(sizeMB) * 1024 * 1024
-	partitionStart := uint64(1024 * 1024) // 1MB offset
+
+	// partitionStart := uint64(1024 * 1024) // 1MB offset for MBR
+	partitionStart := uint64(0) // 0 offset for raw ext4
 	partitionSize := totalSize - partitionStart
 
 	// Create directory if needed
@@ -106,14 +108,8 @@ func New(imagePath string, sizeMB int) (*Ext4ImageBuilder, error) {
 	}, nil
 }
 
-// NewExt4ImageBuilder is kept for backward compatibility and simply
-// forwards to New. Prefer using New in new code.
-func NewExt4ImageBuilder(imagePath string, sizeMB int) (*Ext4ImageBuilder, error) {
-	return New(imagePath, sizeMB)
-}
-
 // PrepareFilesystem initializes the core ext4 filesystem structures.
-// This includes writing the MBR, superblock, group descriptors, bitmaps,
+// This includes writing the superblock, group descriptors, bitmaps,
 // inode tables, and creating essential directories. Must be called before
 // any file or directory creation operations.
 func (e *Ext4ImageBuilder) PrepareFilesystem() error {

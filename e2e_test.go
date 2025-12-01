@@ -68,9 +68,9 @@ func (tc *testContext) finalize() {
 }
 
 // dockerExec runs commands inside a privileged Docker container with the ext4 image mounted.
-// The container extracts the partition from the image, runs e2fsck for validation,
-// mounts the filesystem, executes the provided commands, and returns their output.
-// This provides end-to-end validation that the generated filesystem is correct.
+// The container runs e2fsck for validation on the raw ext4 image, mounts the filesystem,
+// executes the provided commands, and returns their output. This provides end-to-end
+// validation that the generated filesystem is correct.
 func (tc *testContext) dockerExec(commands ...string) (string, string, error) {
 	tc.t.Helper()
 
@@ -79,17 +79,14 @@ set -e
 apk add --no-cache e2fsprogs > /dev/null 2>&1
 
 # Copy image to container filesystem
-cp /image/test.img /tmp/test.img
+cp /image/test.img /tmp/fs.img
 
-# Extract partition (skip 1MB MBR offset)
-dd if=/tmp/test.img of=/tmp/partition.img bs=1M skip=1 2>/dev/null
-
-# Check filesystem
-e2fsck -n -f /tmp/partition.img || { echo "e2fsck failed"; exit 1; }
+# Check filesystem (raw ext4 image, no partition table)
+e2fsck -n -f /tmp/fs.img || { echo "e2fsck failed"; exit 1; }
 
 # Mount the filesystem
 mkdir -p /mnt/ext4
-mount -t ext4 -o loop /tmp/partition.img /mnt/ext4
+mount -t ext4 -o loop /tmp/fs.img /mnt/ext4
 
 # Run the verification commands
 cd /mnt/ext4
@@ -1064,7 +1061,7 @@ func BenchmarkFilesystemCreation(b *testing.B) {
 		tmpDir := b.TempDir()
 		imagePath := filepath.Join(tmpDir, "bench.img")
 
-		builder, err := ext4fs.NewExt4ImageBuilder(imagePath, 64)
+		builder, err := ext4fs.New(imagePath, 64)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -1083,9 +1080,7 @@ func BenchmarkFilesystemCreation(b *testing.B) {
 			}
 		}
 
-		if err := builder.FinalizeMetadata(); err != nil {
-			b.Fatal(err)
-		}
+		// Save() already finalizes metadata internally
 		if err := builder.Save(); err != nil {
 			b.Fatal(err)
 		}
