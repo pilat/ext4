@@ -1,3 +1,23 @@
+// Package ext4fs provides a pure Go implementation for creating and manipulating ext4 filesystem images.
+// It allows building ext4 filesystems programmatically without external dependencies,
+// suitable for creating disk images for virtual machines, containers, or embedded systems.
+//
+// The main entry point is Ext4ImageBuilder in disk.go, which provides a high-level API
+// for creating and managing ext4 images. The internal Builder handles the low-level
+// filesystem construction details.
+//
+// Example usage:
+//
+//	builder, err := ext4fs.NewExt4ImageBuilder("disk.img", 64)
+//	if err != nil {
+//		panic(err)
+//	}
+//
+//	builder.PrepareFilesystem()
+//	rootDir := builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
+//	builder.CreateFile(rootDir, "hostname", []byte("myhost\n"), 0644, 0, 0)
+//	builder.FinalizeMetadata()
+//	builder.Save()
 package ext4fs
 
 const (
@@ -104,25 +124,34 @@ const (
 // On-disk structures (must match kernel exactly)
 // ============================================================================
 
-// MBRPartition is a single MBR partition entry (16 bytes)
+// MBRPartition represents a single MBR partition table entry (16 bytes)
+// as defined in the Master Boot Record specification. Each partition
+// entry contains the partition's boot indicator, CHS addresses, type,
+// and LBA boundaries.
 type MBRPartition struct {
-	BootIndicator byte
-	StartCHS      [3]byte
-	PartType      byte
-	EndCHS        [3]byte
-	StartLBA      uint32
-	SizeLBA       uint32
+	BootIndicator byte    // Boot indicator: 0x80 for bootable, 0x00 otherwise
+	StartCHS      [3]byte // Starting CHS address (Cylinder-Head-Sector)
+	PartType      byte    // Partition type identifier
+	EndCHS        [3]byte // Ending CHS address
+	StartLBA      uint32  // Starting LBA (Logical Block Address)
+	SizeLBA       uint32  // Size in LBA sectors
 }
 
-// MBR is the Master Boot Record (512 bytes)
+// MBR represents the Master Boot Record structure (512 bytes total)
+// located at the first sector of a disk. It contains boot code,
+// up to 4 primary partition entries, and the MBR signature.
 type MBR struct {
-	BootCode   [446]byte
-	Partitions [4]MBRPartition
-	Signature  uint16
+	BootCode   [446]byte       // Boot loader code (446 bytes)
+	Partitions [4]MBRPartition // Four primary partition entries (64 bytes)
+	Signature  uint16          // MBR signature (0xAA55)
 }
 
-// Superblock is the ext4 superblock structure (1024 bytes)
-// Only fields needed for minimal ext4 are included with correct offsets
+// Superblock represents the ext4 superblock structure (1024 bytes total)
+// as defined in the Linux kernel's struct ext4_super_block. The superblock
+// contains global filesystem metadata including block counts, inode counts,
+// supported features, and maintenance information. It is located at offset
+// 1024 bytes from the start of the filesystem. Only fields needed for minimal
+// ext4 compatibility are included with correct byte offsets.
 type Superblock struct {
 	InodesCount       uint32     // 0x00
 	BlocksCountLo     uint32     // 0x04
@@ -227,7 +256,11 @@ type Superblock struct {
 	Checksum          uint32     // 0x3FC
 }
 
-// GroupDesc32 is the 32-byte block group descriptor (non-64bit mode)
+// GroupDesc32 represents the 32-byte block group descriptor structure
+// used in non-64bit ext4 filesystems. Each block group has a descriptor
+// that tracks the location of bitmaps, inode tables, and usage statistics
+// for that specific block group. This enables parallel operations across
+// multiple block groups.
 type GroupDesc32 struct {
 	BlockBitmapLo     uint32 // Block bitmap block
 	InodeBitmapLo     uint32 // Inode bitmap block
@@ -243,7 +276,11 @@ type GroupDesc32 struct {
 	Checksum          uint16 // Group checksum
 }
 
-// Inode is the ext4 inode structure (256 bytes with extra fields)
+// Inode represents the ext4 inode structure (256 bytes total)
+// as defined in the Linux kernel's struct ext4_inode. Each inode
+// contains metadata about a file or directory including ownership,
+// permissions, timestamps, and block pointers or extent tree root.
+// The inode number uniquely identifies each file system object.
 type Inode struct {
 	Mode        uint16   // 0x00: File mode
 	UID         uint16   // 0x02: Owner UID
@@ -281,7 +318,10 @@ type Inode struct {
 	Padding [96]byte // 0xA0-0xFF
 }
 
-// ExtentHeader is the extent tree header (12 bytes)
+// ExtentHeader represents the header of an ext4 extent tree node (12 bytes).
+// Extent trees replace traditional block pointers in inodes for files using
+// extents. The header contains metadata about the extent tree including
+// the number of entries, maximum entries, tree depth, and generation number.
 type ExtentHeader struct {
 	Magic      uint16 // 0xF30A
 	Entries    uint16 // Number of entries
@@ -290,7 +330,10 @@ type ExtentHeader struct {
 	Generation uint32 // Generation
 }
 
-// Extent is a leaf extent (12 bytes)
+// Extent represents a leaf node in the ext4 extent tree (12 bytes).
+// Each extent describes a contiguous range of blocks on disk that belong
+// to a file. Multiple extents can be combined to represent sparse files
+// or files with non-contiguous allocations.
 type Extent struct {
 	Block   uint32 // First logical block
 	Len     uint16 // Number of blocks
@@ -298,7 +341,10 @@ type Extent struct {
 	StartLo uint32 // Physical block low
 }
 
-// DirEntry is a directory entry (variable length)
+// DirEntry represents an ext4 directory entry with file type information.
+// Directory entries map filenames to inode numbers and contain metadata
+// about the file type. The structure is variable-length to accommodate
+// different filename lengths up to 255 bytes.
 type DirEntry struct {
 	Inode   uint32 // Inode number
 	RecLen  uint16 // Record length
@@ -307,7 +353,10 @@ type DirEntry struct {
 	Name    []byte // Name (up to 255)
 }
 
-// XattrEntry represents an extended attribute
+// XattrEntry represents an extended attribute (xattr) attached to an inode.
+// Extended attributes provide additional metadata beyond standard file attributes,
+// organized into namespaces like user, trusted, security, and system.
+// Each xattr consists of a name index, name, and value.
 type XattrEntry struct {
 	NameIndex uint8
 	Name      string // Without namespace prefix

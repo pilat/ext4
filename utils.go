@@ -5,7 +5,9 @@ import (
 	"strings"
 )
 
-// isSparseGroup checks if group should have superblock backup
+// isSparseGroup checks if a block group should contain a superblock backup.
+// Ext4 uses sparse superblock placement to reduce metadata overhead.
+// Groups 0, 1 and powers of 3, 5, and 7 get superblock backups.
 func isSparseGroup(group uint32) bool {
 	if group <= 1 {
 		return true
@@ -21,7 +23,9 @@ func isSparseGroup(group uint32) bool {
 	return false
 }
 
-// lbaToCHS converts LBA to CHS addressing (simplified, for compatibility only).
+// lbaToCHS converts Logical Block Addressing to Cylinder-Head-Sector format.
+// This is used in the MBR partition table for legacy BIOS compatibility.
+// The conversion is simplified and not used for actual disk access.
 func lbaToCHS(lba uint32) [3]byte {
 	sectorsPerTrack := uint32(63)
 	heads := uint32(255)
@@ -42,7 +46,9 @@ func lbaToCHS(lba uint32) [3]byte {
 	}
 }
 
-// validateName checks if a filename is valid for ext4
+// validateName checks if a filename is valid for use in an ext4 filesystem.
+// Enforces ext4 naming restrictions including length limits, forbidden characters,
+// and reserved names. Used before creating files or directories.
 func validateName(name string) error {
 	if len(name) == 0 {
 		return fmt.Errorf("filename cannot be empty")

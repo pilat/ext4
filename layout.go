@@ -4,7 +4,9 @@ import (
 	"fmt"
 )
 
-// Layout contains pre-calculated filesystem layout
+// Layout contains pre-calculated filesystem layout parameters.
+// This structure holds all the geometry and metadata positioning information
+// needed to construct an ext4 filesystem with proper block and inode allocation.
 type Layout struct {
 	// Partition geometry
 	PartitionStart uint64
@@ -23,7 +25,9 @@ type Layout struct {
 	CreatedAt uint32
 }
 
-// GroupLayout holds the block positions for a specific group
+// GroupLayout holds the block positions and metadata layout for a specific block group.
+// Each block group contains its own metadata (bitmaps, inode table) and data blocks.
+// This structure defines where each component is located within the group.
 type GroupLayout struct {
 	GroupStart       uint32 // First block of this group
 	SuperblockBlock  uint32 // 0 if no superblock backup
@@ -37,7 +41,9 @@ type GroupLayout struct {
 	OverheadBlocks   uint32 // Metadata blocks in this group
 }
 
-// CalculateLayout computes the complete filesystem layout
+// CalculateLayout computes the complete filesystem layout based on partition geometry.
+// Determines the number of block groups, block and inode distribution, and metadata placement.
+// The layout ensures optimal performance and compatibility with ext4 specifications.
 func CalculateLayout(partitionStart, partitionSize uint64, createdAt uint32) (*Layout, error) {
 	if partitionSize < 4*1024*1024 {
 		return nil, fmt.Errorf("partition too small: need at least 4MB, got %d", partitionSize)
@@ -66,7 +72,10 @@ func CalculateLayout(partitionStart, partitionSize uint64, createdAt uint32) (*L
 	return l, nil
 }
 
-// GetGroupLayout calculates layout for a specific group
+// GetGroupLayout calculates the detailed layout for a specific block group.
+// Determines the positions of superblock backups, group descriptors, bitmaps,
+// inode tables, and data blocks within the group. Accounts for sparse superblock
+// placement to optimize metadata distribution.
 func (l *Layout) GetGroupLayout(group uint32) GroupLayout {
 	gl := GroupLayout{
 		GroupStart: group * BlocksPerGroup,
@@ -111,12 +120,15 @@ func (l *Layout) GetGroupLayout(group uint32) GroupLayout {
 	return gl
 }
 
-// BlockOffset returns absolute byte offset for a block number
+// BlockOffset returns the absolute byte offset for a given block number.
+// Converts logical block numbers to physical byte positions within the partition.
 func (l *Layout) BlockOffset(blockNum uint32) uint64 {
 	return l.PartitionStart + uint64(blockNum)*BlockSize
 }
 
-// InodeOffset returns absolute byte offset for an inode
+// InodeOffset returns the absolute byte offset for a given inode number.
+// Calculates which block group contains the inode and its position within
+// the group's inode table. Inode numbers start from 1.
 func (l *Layout) InodeOffset(inodeNum uint32) uint64 {
 	if inodeNum < 1 {
 		panic(fmt.Sprintf("invalid inode number: %d", inodeNum))
@@ -130,12 +142,15 @@ func (l *Layout) InodeOffset(inodeNum uint32) uint64 {
 	return l.BlockOffset(gl.InodeTableStart) + uint64(indexInGroup)*InodeSize
 }
 
-// TotalInodes returns total inode count
+// TotalInodes returns the total number of inodes available in the filesystem.
+// Calculated as the number of block groups multiplied by inodes per group.
 func (l *Layout) TotalInodes() uint32 {
 	return l.GroupCount * InodesPerGroup
 }
 
-// TotalFreeBlocks calculates initial free blocks
+// TotalFreeBlocks calculates the initial number of free blocks available for data.
+// Subtracts all metadata overhead (superblocks, group descriptors, bitmaps, inode tables)
+// from the total blocks to determine usable data space.
 func (l *Layout) TotalFreeBlocks() uint32 {
 	var overhead uint32
 	for g := uint32(0); g < l.GroupCount; g++ {
@@ -148,7 +163,8 @@ func (l *Layout) TotalFreeBlocks() uint32 {
 	return 0
 }
 
-// String returns a human-readable layout description
+// String returns a human-readable description of the filesystem layout.
+// Useful for debugging and understanding the calculated geometry parameters.
 func (l *Layout) String() string {
 	return fmt.Sprintf(`Filesystem Layout:
   Partition: offset=%d, size=%d bytes

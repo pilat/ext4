@@ -7,12 +7,17 @@ import (
 	"time"
 )
 
-// diskBackend abstracts I/O operations
+// diskBackend abstracts I/O operations for different storage backends.
+// This interface allows the filesystem builder to work with various storage
+// types (files, memory buffers, network storage) through a common API.
 type diskBackend interface {
 	ReadAt(p []byte, off int64) (n int, err error)
 	WriteAt(p []byte, off int64) (n int, err error)
 }
 
+// fileBackend implements diskBackend using a regular file on disk.
+// Provides random access read/write operations for ext4 image files.
+// Includes additional methods for synchronization and resource cleanup.
 type fileBackend struct {
 	f *os.File
 }
@@ -22,14 +27,19 @@ func (fb *fileBackend) WriteAt(p []byte, off int64) (int, error) { return fb.f.W
 func (fb *fileBackend) Sync() error                              { return fb.f.Sync() }
 func (fb *fileBackend) Close() error                             { return fb.f.Close() }
 
-// Ext4ImageBuilder is the public API (wraps Builder)
+// Ext4ImageBuilder provides the public API for creating ext4 filesystem images.
+// It wraps the internal Builder with file-based storage and provides high-level
+// methods for filesystem construction, metadata management, and image persistence.
 type Ext4ImageBuilder struct {
-	builder   *Builder
-	imagePath string
-	disk      *fileBackend
+	builder   *Builder     // Internal filesystem builder
+	imagePath string       // Path to the output image file
+	disk      *fileBackend // File-based storage backend
 }
 
-// NewExt4ImageBuilder creates a new ext4 image
+// NewExt4ImageBuilder creates a new ext4 filesystem image at the specified path.
+// The image size must be at least 4MB. Creates the necessary directory structure,
+// allocates the image file, and initializes the filesystem layout and builder.
+// Returns an Ext4ImageBuilder ready for filesystem construction operations.
 func NewExt4ImageBuilder(imagePath string, sizeMB int) (*Ext4ImageBuilder, error) {
 	if sizeMB < 4 {
 		return nil, fmt.Errorf("minimum size is 4MB")
@@ -74,57 +84,79 @@ func NewExt4ImageBuilder(imagePath string, sizeMB int) (*Ext4ImageBuilder, error
 	}, nil
 }
 
-// PrepareFilesystem initializes filesystem structures
+// PrepareFilesystem initializes the core ext4 filesystem structures.
+// This includes writing the MBR, superblock, group descriptors, bitmaps,
+// inode tables, and creating essential directories. Must be called before
+// any file or directory creation operations.
 func (e *Ext4ImageBuilder) PrepareFilesystem() {
 	e.builder.PrepareFilesystem()
 }
 
-// CreateDirectory creates a directory
+// CreateDirectory creates a new directory under the specified parent directory.
+// Returns the inode number of the created directory, or an error if creation fails.
+// The directory will be initialized with "." and ".." entries.
 func (e *Ext4ImageBuilder) CreateDirectory(parent uint32, name string, mode, uid, gid uint16) (uint32, error) {
 	return e.builder.CreateDirectory(parent, name, mode, uid, gid)
 }
 
-// CreateFile creates a file
+// CreateFile creates a new regular file with the specified content.
+// If a file with the same name exists, it will be overwritten.
+// Returns the inode number of the created or overwritten file.
 func (e *Ext4ImageBuilder) CreateFile(parent uint32, name string, content []byte, mode, uid, gid uint16) (uint32, error) {
 	return e.builder.CreateFile(parent, name, content, mode, uid, gid)
 }
 
-// CreateSymlink creates a symbolic link
+// CreateSymlink creates a symbolic link pointing to the specified target path.
+// For targets <= 60 bytes, the target is stored directly in the inode.
+// For longer targets, a separate data block is allocated.
 func (e *Ext4ImageBuilder) CreateSymlink(parent uint32, name, target string, uid, gid uint16) (uint32, error) {
 	return e.builder.CreateSymlink(parent, name, target, uid, gid)
 }
 
-// SetXattr sets an extended attribute on an inode
+// SetXattr sets an extended attribute on the specified inode.
+// Extended attributes use namespace prefixes like "user.", "trusted.", etc.
+// If the attribute already exists, its value is updated.
 func (e *Ext4ImageBuilder) SetXattr(inodeNum uint32, name string, value []byte) error {
 	return e.builder.SetXattr(inodeNum, name, value)
 }
 
-// GetXattr retrieves an extended attribute from an inode
+// GetXattr retrieves the value of an extended attribute from the specified inode.
+// Returns the attribute value as a byte slice, or an error if the attribute doesn't exist.
 func (e *Ext4ImageBuilder) GetXattr(inodeNum uint32, name string) ([]byte, error) {
 	return e.builder.GetXattr(inodeNum, name)
 }
 
-// ListXattrs returns all extended attribute names for an inode
+// ListXattrs returns a list of all extended attribute names for the specified inode.
+// Names include their namespace prefixes (e.g., "user.attr", "trusted.security").
 func (e *Ext4ImageBuilder) ListXattrs(inodeNum uint32) ([]string, error) {
 	return e.builder.ListXattrs(inodeNum)
 }
 
-// RemoveXattr removes an extended attribute from an inode
+// RemoveXattr removes an extended attribute from the specified inode.
+// If the attribute doesn't exist, no error is returned.
+// The xattr block may be deallocated if it becomes empty.
 func (e *Ext4ImageBuilder) RemoveXattr(inodeNum uint32, name string) error {
 	return e.builder.RemoveXattr(inodeNum, name)
 }
 
-// FinalizeMetadata updates counters
+// FinalizeMetadata updates all filesystem metadata to reflect final state.
+// This includes recalculating block and inode usage statistics,
+// updating group descriptors, and ensuring the superblock is current.
+// Must be called after all file operations are complete.
 func (e *Ext4ImageBuilder) FinalizeMetadata() {
 	e.builder.FinalizeMetadata()
 }
 
-// Save syncs to disk
+// Save synchronizes all pending writes to the underlying storage.
+// Ensures that all filesystem data is durably written to disk before
+// the image is considered complete and ready for use.
 func (e *Ext4ImageBuilder) Save() error {
 	return e.disk.Sync()
 }
 
-// Close releases resources
+// Close releases all resources associated with the image builder.
+// This includes closing the underlying file handle and freeing any
+// internal data structures. The image file remains on disk.
 func (e *Ext4ImageBuilder) Close() error {
 	return e.disk.Close()
 }

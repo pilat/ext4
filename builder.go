@@ -12,6 +12,7 @@ var DEBUG = false
 type Builder struct {
 	disk   diskBackend
 	layout *Layout
+	debug  bool // Enable debug output
 
 	// Allocation state - per group
 	nextBlockPerGroup   []uint32 // Next free block in each group
@@ -23,10 +24,14 @@ type Builder struct {
 	usedDirsPerGroup []uint16 // Directory count per group
 }
 
+// newBuilder creates a new Builder instance with initialized allocation state.
+// It sets up per-group tracking for block and inode allocation, preparing
+// the builder for filesystem construction operations.
 func newBuilder(disk diskBackend, layout *Layout) *Builder {
 	b := &Builder{
 		disk:                disk,
 		layout:              layout,
+		debug:               DEBUG,
 		nextBlockPerGroup:   make([]uint32, layout.GroupCount),
 		freedBlocksPerGroup: make([]uint32, layout.GroupCount),
 		freeBlockList:       make([]uint32, 0),
@@ -43,8 +48,12 @@ func newBuilder(disk diskBackend, layout *Layout) *Builder {
 	return b
 }
 
+// PrepareFilesystem initializes the complete ext4 filesystem structure.
+// This includes writing the MBR, superblock, group descriptors, initializing
+// bitmaps, zeroing inode tables, and creating essential directories like
+// root and lost+found. This method must be called before any file operations.
 func (b *Builder) PrepareFilesystem() error {
-	if DEBUG {
+	if b.debug {
 		fmt.Println(b.layout.String())
 		fmt.Println()
 	}
@@ -64,440 +73,12 @@ func (b *Builder) PrepareFilesystem() error {
 }
 
 // ============================================================================
-// Public API
+// Internal methods
 // ============================================================================
 
-func (b *Builder) CreateDirectory(parentInode uint32, name string, mode, uid, gid uint16) (uint32, error) {
-	if err := validateName(name); err != nil {
-		return 0, fmt.Errorf("invalid directory name: %w", err)
-	}
-
-	inodeNum, err := b.allocateInode()
-	if err != nil {
-		return 0, err
-	}
-
-	dataBlock, err := b.allocateBlock()
-	if err != nil {
-		return 0, err
-	}
-
-	inode := b.makeDirectoryInode(mode, uid, gid)
-	inode.LinksCount = 2
-	inode.SizeLo = BlockSize
-	inode.BlocksLo = BlockSize / 512
-	b.setExtent(&inode, 0, dataBlock, 1)
-
-	b.writeInode(inodeNum, &inode)
-
-	entries := []DirEntry{
-		{Inode: inodeNum, Type: FTDir, Name: []byte(".")},
-		{Inode: parentInode, Type: FTDir, Name: []byte("..")},
-	}
-	b.writeDirBlock(dataBlock, entries)
-
-	b.addDirEntry(parentInode, DirEntry{
-		Inode: inodeNum,
-		Type:  FTDir,
-		Name:  []byte(name),
-	})
-
-	b.incrementLinkCount(parentInode)
-
-	// Track directory in correct group
-	group := (inodeNum - 1) / InodesPerGroup
-	b.usedDirsPerGroup[group]++
-
-	if DEBUG {
-		fmt.Printf("✓ Created directory: %s (inode %d)\n", name, inodeNum)
-	}
-
-	return inodeNum, nil
-}
-
-func (b *Builder) CreateFile(parentInode uint32, name string, content []byte, mode, uid, gid uint16) (uint32, error) {
-	if err := validateName(name); err != nil {
-		return 0, fmt.Errorf("invalid file name: %w", err)
-	}
-
-	existingInode := b.findEntry(parentInode, name)
-	if existingInode != 0 {
-		return b.overwriteFile(existingInode, content, mode, uid, gid)
-	}
-
-	inodeNum, err := b.allocateInode()
-	if err != nil {
-		return 0, err
-	}
-
-	size := uint64(len(content))
-	blocksNeeded := uint32((size + BlockSize - 1) / BlockSize)
-	if blocksNeeded == 0 {
-		blocksNeeded = 1
-	}
-
-	inode := b.makeFileInode(mode, uid, gid, size)
-
-	blocks, err := b.allocateBlocks(blocksNeeded)
-	if err != nil {
-		return 0, err
-	}
-
-	if blocksNeeded == 1 {
-		b.setExtent(&inode, 0, blocks[0], 1)
-	} else {
-		if err := b.setExtentMultiple(&inode, blocks); err != nil {
-			return 0, err
-		}
-	}
-	inode.BlocksLo = blocksNeeded * (BlockSize / 512)
-
-	// Write content
-	for i, blk := range blocks {
-		block := make([]byte, BlockSize)
-		start := uint64(i) * BlockSize
-		end := start + BlockSize
-		if end > size {
-			end = size
-		}
-		if start < size {
-			copy(block, content[start:end])
-		}
-		b.disk.WriteAt(block, int64(b.layout.BlockOffset(blk)))
-	}
-
-	b.writeInode(inodeNum, &inode)
-
-	b.addDirEntry(parentInode, DirEntry{
-		Inode: inodeNum,
-		Type:  FTRegFile,
-		Name:  []byte(name),
-	})
-
-	if DEBUG {
-		fmt.Printf("✓ Created file: %s (inode %d, size %d)\n", name, inodeNum, size)
-	}
-
-	return inodeNum, nil
-}
-
-func (b *Builder) CreateSymlink(parentInode uint32, name, target string, uid, gid uint16) (uint32, error) {
-	if err := validateName(name); err != nil {
-		return 0, fmt.Errorf("invalid symlink name: %w", err)
-	}
-
-	if len(target) == 0 {
-		return 0, fmt.Errorf("symlink target cannot be empty")
-	}
-
-	if len(target) > 4096 {
-		return 0, fmt.Errorf("symlink target too long: %d > 4096", len(target))
-	}
-
-	inodeNum, err := b.allocateInode()
-	if err != nil {
-		return 0, err
-	}
-
-	inode := Inode{
-		Mode:       S_IFLNK | 0777,
-		UID:        uid,
-		GID:        gid,
-		SizeLo:     uint32(len(target)),
-		LinksCount: 1,
-		Atime:      b.layout.CreatedAt,
-		Ctime:      b.layout.CreatedAt,
-		Mtime:      b.layout.CreatedAt,
-		Crtime:     b.layout.CreatedAt,
-		ExtraIsize: 32,
-	}
-
-	// Fast symlink: target stored in inode.Block (up to 60 bytes)
-	if len(target) <= 60 {
-		copy(inode.Block[:], target)
-		inode.Flags = 0
-		inode.BlocksLo = 0
-	} else {
-		inode.Flags = InodeFlagExtents
-		dataBlock, err := b.allocateBlock()
-		if err != nil {
-			return 0, err
-		}
-		b.initExtentHeader(&inode)
-		b.setExtent(&inode, 0, dataBlock, 1)
-		inode.BlocksLo = BlockSize / 512
-
-		block := make([]byte, BlockSize)
-		copy(block, target)
-		b.disk.WriteAt(block, int64(b.layout.BlockOffset(dataBlock)))
-	}
-
-	b.writeInode(inodeNum, &inode)
-
-	b.addDirEntry(parentInode, DirEntry{
-		Inode: inodeNum,
-		Type:  FTSymlink,
-		Name:  []byte(name),
-	})
-
-	if DEBUG {
-		fmt.Printf("✓ Created symlink: %s -> %s\n", name, target)
-	}
-
-	return inodeNum, nil
-}
-
-// SetXattr sets an extended attribute on an inode
-func (b *Builder) SetXattr(inodeNum uint32, name string, value []byte) error {
-	if len(name) == 0 {
-		return fmt.Errorf("xattr name cannot be empty")
-	}
-
-	nameIndex, shortName, err := parseXattrName(name)
-	if err != nil {
-		return err
-	}
-
-	if len(shortName) > 255 {
-		return fmt.Errorf("xattr name too long: %d > 255", len(shortName))
-	}
-
-	inode := b.readInode(inodeNum)
-
-	var xattrBlock uint32
-	var entries []XattrEntry
-
-	if inode.FileACLLo != 0 {
-		xattrBlock = inode.FileACLLo
-		entries = b.readXattrBlock(xattrBlock)
-	} else {
-		var err error
-		xattrBlock, err = b.allocateBlock()
-		if err != nil {
-			return err
-		}
-		inode.FileACLLo = xattrBlock
-		inode.BlocksLo += BlockSize / 512
-	}
-
-	// Update existing or add new entry
-	found := false
-	for i, e := range entries {
-		if e.NameIndex == nameIndex && e.Name == shortName {
-			entries[i].Value = value
-			found = true
-			break
-		}
-	}
-	if !found {
-		entries = append(entries, XattrEntry{
-			NameIndex: nameIndex,
-			Name:      shortName,
-			Value:     value,
-		})
-	}
-
-	if err := b.writeXattrBlock(xattrBlock, entries); err != nil {
-		return err
-	}
-
-	b.writeInode(inodeNum, inode)
-
-	if DEBUG {
-		fmt.Printf("✓ Set xattr %s on inode %d (%d bytes)\n", name, inodeNum, len(value))
-	}
-
-	return nil
-}
-
-// GetXattr retrieves an extended attribute from an inode (for testing)
-func (b *Builder) GetXattr(inodeNum uint32, name string) ([]byte, error) {
-	nameIndex, shortName, err := parseXattrName(name)
-	if err != nil {
-		return nil, err
-	}
-
-	inode := b.readInode(inodeNum)
-	if inode.FileACLLo == 0 {
-		return nil, fmt.Errorf("no xattrs on inode %d", inodeNum)
-	}
-
-	entries := b.readXattrBlock(inode.FileACLLo)
-	for _, e := range entries {
-		if e.NameIndex == nameIndex && e.Name == shortName {
-			return e.Value, nil
-		}
-	}
-
-	return nil, fmt.Errorf("xattr %s not found", name)
-}
-
-// ListXattrs returns all extended attribute names for an inode
-func (b *Builder) ListXattrs(inodeNum uint32) ([]string, error) {
-	inode := b.readInode(inodeNum)
-	if inode.FileACLLo == 0 {
-		return nil, nil
-	}
-
-	entries := b.readXattrBlock(inode.FileACLLo)
-	names := make([]string, 0, len(entries))
-
-	for _, e := range entries {
-		prefix := xattrIndexToPrefix(e.NameIndex)
-		names = append(names, prefix+e.Name)
-	}
-
-	return names, nil
-}
-
-// RemoveXattr removes an extended attribute from an inode
-func (b *Builder) RemoveXattr(inodeNum uint32, name string) error {
-	nameIndex, shortName, err := parseXattrName(name)
-	if err != nil {
-		return err
-	}
-
-	inode := b.readInode(inodeNum)
-	if inode.FileACLLo == 0 {
-		return fmt.Errorf("no xattrs on inode %d", inodeNum)
-	}
-
-	entries := b.readXattrBlock(inode.FileACLLo)
-	newEntries := make([]XattrEntry, 0, len(entries))
-	found := false
-
-	for _, e := range entries {
-		if e.NameIndex == nameIndex && e.Name == shortName {
-			found = true
-			continue
-		}
-		newEntries = append(newEntries, e)
-	}
-
-	if !found {
-		return fmt.Errorf("xattr %s not found", name)
-	}
-
-	if len(newEntries) == 0 {
-		// Free the xattr block
-		b.freeBlock(inode.FileACLLo)
-		inode.FileACLLo = 0
-		inode.BlocksLo -= BlockSize / 512
-	} else {
-		if err := b.writeXattrBlock(inode.FileACLLo, newEntries); err != nil {
-			return err
-		}
-	}
-
-	b.writeInode(inodeNum, inode)
-	return nil
-}
-
-func (b *Builder) FinalizeMetadata() {
-	// Calculate per-group statistics
-	for g := uint32(0); g < b.layout.GroupCount; g++ {
-		gl := b.layout.GetGroupLayout(g)
-
-		// Count used blocks in this group (accounting for freed blocks)
-		usedBlocks := b.nextBlockPerGroup[g] - gl.GroupStart - b.freedBlocksPerGroup[g]
-		freeBlocks := gl.BlocksInGroup - usedBlocks
-
-		// Calculate inode usage for this group
-		groupStartInode := g*InodesPerGroup + 1
-		groupEndInode := groupStartInode + InodesPerGroup
-
-		var usedInodes uint16
-		var highestUsedInode uint32
-
-		if b.nextInode > groupStartInode {
-			if b.nextInode >= groupEndInode {
-				usedInodes = uint16(InodesPerGroup)
-				highestUsedInode = InodesPerGroup
-			} else {
-				usedInodes = uint16(b.nextInode - groupStartInode)
-				highestUsedInode = b.nextInode - groupStartInode
-			}
-		}
-
-		// For group 0, account for reserved inodes
-		if g == 0 {
-			if highestUsedInode < FirstNonResInode-1 {
-				highestUsedInode = FirstNonResInode - 1
-			}
-			if usedInodes < uint16(FirstNonResInode-1) {
-				usedInodes = uint16(FirstNonResInode - 1)
-			}
-		}
-
-		freeInodes := uint16(InodesPerGroup) - usedInodes
-		// ItableUnused = inodes from highest used to end of table
-		itableUnused := uint16(InodesPerGroup - highestUsedInode)
-
-		// Read current group descriptor
-		gdOffset := b.layout.BlockOffset(b.layout.GetGroupLayout(0).GDTStart) + uint64(g*32)
-		gdBuf := make([]byte, 32)
-		b.disk.ReadAt(gdBuf, int64(gdOffset))
-
-		// Update fields
-		binary.LittleEndian.PutUint16(gdBuf[12:14], uint16(freeBlocks))
-		binary.LittleEndian.PutUint16(gdBuf[14:16], freeInodes)
-		// UsedDirsCount for THIS group
-		binary.LittleEndian.PutUint16(gdBuf[16:18], b.usedDirsPerGroup[g])
-		// Flags at offset 18 - don't set BGInodeZeroed without metadata_csum
-		binary.LittleEndian.PutUint16(gdBuf[18:20], 0)
-		// ItableUnusedLo at offset 28
-		binary.LittleEndian.PutUint16(gdBuf[28:30], itableUnused)
-
-		b.disk.WriteAt(gdBuf, int64(gdOffset))
-
-		// Update backup GDTs
-		for bg := uint32(1); bg < b.layout.GroupCount; bg++ {
-			if isSparseGroup(bg) {
-				backupGl := b.layout.GetGroupLayout(bg)
-				backupOffset := b.layout.BlockOffset(backupGl.GDTStart) + uint64(g*32)
-				b.disk.WriteAt(gdBuf, int64(backupOffset))
-			}
-		}
-	}
-
-	// Calculate totals for superblock
-	var totalFreeBlocks uint32
-	var totalFreeInodes uint32
-	for g := uint32(0); g < b.layout.GroupCount; g++ {
-		gl := b.layout.GetGroupLayout(g)
-		usedBlocks := b.nextBlockPerGroup[g] - gl.GroupStart - b.freedBlocksPerGroup[g]
-		totalFreeBlocks += gl.BlocksInGroup - usedBlocks
-	}
-	totalFreeInodes = b.layout.TotalInodes() - (b.nextInode - 1)
-
-	// Update primary superblock
-	sbOffset := b.layout.PartitionStart + SuperblockOffset
-	sbBuf := make([]byte, 1024)
-	b.disk.ReadAt(sbBuf, int64(sbOffset))
-
-	binary.LittleEndian.PutUint32(sbBuf[0x0C:0x10], totalFreeBlocks)
-	binary.LittleEndian.PutUint32(sbBuf[0x10:0x14], totalFreeInodes)
-
-	b.disk.WriteAt(sbBuf, int64(sbOffset))
-
-	// Update backup superblocks
-	for g := uint32(1); g < b.layout.GroupCount; g++ {
-		if isSparseGroup(g) {
-			gl := b.layout.GetGroupLayout(g)
-			backupSbOffset := b.layout.BlockOffset(gl.SuperblockBlock)
-			b.disk.ReadAt(sbBuf, int64(backupSbOffset))
-			binary.LittleEndian.PutUint32(sbBuf[0x0C:0x10], totalFreeBlocks)
-			binary.LittleEndian.PutUint32(sbBuf[0x10:0x14], totalFreeInodes)
-			b.disk.WriteAt(sbBuf, int64(backupSbOffset))
-		}
-	}
-
-	if DEBUG {
-		fmt.Printf("✓ Metadata finalized: %d free blocks, %d free inodes\n",
-			totalFreeBlocks, totalFreeInodes)
-	}
-}
-
+// writeMBR writes the Master Boot Record to the first 512 bytes of the disk.
+// The MBR contains the partition table with a single ext4 partition spanning
+// the entire disk. This is required for the disk to be recognized as partitioned.
 func (b *Builder) writeMBR() {
 	mbr := MBR{
 		Signature: MBRSignature,
@@ -524,6 +105,10 @@ func (b *Builder) writeMBR() {
 	}
 }
 
+// writeSuperblock writes the ext4 superblock to offset 1024 bytes on disk.
+// The superblock contains global filesystem parameters including block size,
+// inode count, feature flags, and creation timestamp. It serves as the
+// filesystem's "header" containing essential metadata.
 func (b *Builder) writeSuperblock() {
 	sb := Superblock{
 		Magic:             Ext4Magic,
@@ -598,6 +183,10 @@ func (b *Builder) writeSuperblock() {
 	}
 }
 
+// writeGroupDescriptors writes the group descriptor table (GDT) after the superblock.
+// Each group descriptor (32 bytes) contains metadata for its block group including
+// locations of bitmaps, inode tables, and usage statistics. The GDT enables
+// efficient parallel operations across multiple block groups.
 func (b *Builder) writeGroupDescriptors() {
 	gdt := make([]byte, b.layout.GroupCount*32)
 
@@ -641,6 +230,9 @@ func (b *Builder) writeGroupDescriptors() {
 	}
 }
 
+// initBitmaps initializes the block and inode bitmaps for all block groups.
+// Block bitmaps track which blocks are allocated, while inode bitmaps track
+// which inodes are in use. Reserved inodes (1-10) are marked as used during initialization.
 func (b *Builder) initBitmaps() {
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
 		gl := b.layout.GetGroupLayout(g)
@@ -690,6 +282,9 @@ func (b *Builder) initBitmaps() {
 	}
 }
 
+// zeroInodeTables initializes all inode table blocks to zero.
+// Inode tables store the actual inode structures for each block group.
+// Zeroing ensures no garbage data remains from previous filesystem states.
 func (b *Builder) zeroInodeTables() {
 	zeroBlock := make([]byte, BlockSize)
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
@@ -704,6 +299,9 @@ func (b *Builder) zeroInodeTables() {
 	}
 }
 
+// createRootDirectory creates the root directory (inode 2) with essential entries.
+// The root directory contains "." and ".." entries pointing to itself, and serves
+// as the mount point for the filesystem. It is allocated inode 2 by convention.
 func (b *Builder) createRootDirectory() {
 	dataBlock, _ := b.allocateBlock() // Ошибка невозможна при инициализации
 
@@ -730,6 +328,9 @@ func (b *Builder) createRootDirectory() {
 	}
 }
 
+// createLostFound creates the lost+found directory required by ext4 filesystem standard.
+// This directory is used by fsck and other utilities to store orphaned files
+// and directories found during filesystem recovery operations.
 func (b *Builder) createLostFound() {
 	inodeNum, _ := b.allocateInode()
 	dataBlock, _ := b.allocateBlock()
@@ -765,7 +366,9 @@ func (b *Builder) createLostFound() {
 	}
 }
 
-// Add this new function to free blocks in bitmap
+// freeBlock marks a block as free in the appropriate block bitmap.
+// This allows previously allocated blocks to be reused for future allocations.
+// The block is added to the free block list for efficient reuse.
 func (b *Builder) freeBlock(blockNum uint32) {
 	group := blockNum / BlocksPerGroup
 	indexInGroup := blockNum % BlocksPerGroup
@@ -787,6 +390,9 @@ func (b *Builder) freeBlock(blockNum uint32) {
 // Block allocation - uses all groups
 // ============================================================================
 
+// allocateBlock allocates a single free block from the filesystem.
+// It first tries to reuse blocks from the free block list, then searches
+// block groups for available blocks. Returns the allocated block number.
 func (b *Builder) allocateBlock() (uint32, error) {
 	// First, try to reuse a freed block
 	if len(b.freeBlockList) > 0 {
@@ -815,6 +421,10 @@ func (b *Builder) allocateBlock() (uint32, error) {
 	return 0, fmt.Errorf("out of blocks")
 }
 
+// allocateBlocks allocates n consecutive free blocks from the filesystem.
+// For small allocations, it tries to find contiguous blocks within a single group.
+// For larger allocations, it may allocate across multiple groups.
+// Returns a slice of allocated block numbers.
 func (b *Builder) allocateBlocks(n uint32) ([]uint32, error) {
 	if n == 0 {
 		return nil, nil
@@ -870,6 +480,9 @@ func (b *Builder) allocateBlocks(n uint32) ([]uint32, error) {
 	return blocks, nil
 }
 
+// allocateInode allocates the next available inode number from the global sequence.
+// Inodes are allocated sequentially starting from FirstNonResInode (11).
+// Returns the allocated inode number or an error if no inodes are available.
 func (b *Builder) allocateInode() (uint32, error) {
 	if b.nextInode > b.layout.TotalInodes() {
 		return 0, fmt.Errorf("out of inodes: %d", b.nextInode)
@@ -885,6 +498,9 @@ func (b *Builder) allocateInode() (uint32, error) {
 // Bitmap operations
 // ============================================================================
 
+// markBlockUsed marks the specified block as used in its group's block bitmap.
+// This prevents the block from being allocated again until it is explicitly freed.
+// The bitmap is updated on disk to reflect the new allocation state.
 func (b *Builder) markBlockUsed(blockNum uint32) {
 	group := blockNum / BlocksPerGroup
 	indexInGroup := blockNum % BlocksPerGroup
@@ -898,6 +514,9 @@ func (b *Builder) markBlockUsed(blockNum uint32) {
 	b.disk.WriteAt(buf[:], int64(offset))
 }
 
+// markInodeUsed marks the specified inode as used in its group's inode bitmap.
+// This prevents the inode from being allocated again and updates the bitmap on disk.
+// Inode 0 is invalid and should never be marked as used.
 func (b *Builder) markInodeUsed(inodeNum uint32) {
 	if inodeNum < 1 {
 		return
@@ -918,6 +537,9 @@ func (b *Builder) markInodeUsed(inodeNum uint32) {
 // Inode helpers
 // ============================================================================
 
+// makeDirectoryInode creates a new inode structure configured for a directory.
+// Directory inodes have specific mode flags and initial link count of 2
+// (accounting for "." and ".." entries). Timestamps are set to the filesystem creation time.
 func (b *Builder) makeDirectoryInode(mode, uid, gid uint16) Inode {
 	inode := Inode{
 		Mode:       S_IFDIR | mode,
@@ -935,6 +557,9 @@ func (b *Builder) makeDirectoryInode(mode, uid, gid uint16) Inode {
 	return inode
 }
 
+// makeFileInode creates a new inode structure configured for a regular file.
+// The inode is initialized with the specified size, ownership, and permissions.
+// Regular files use extent trees for block mapping and have appropriate mode flags.
 func (b *Builder) makeFileInode(mode, uid, gid uint16, size uint64) Inode {
 	inode := Inode{
 		Mode:       S_IFREG | mode,
@@ -954,6 +579,9 @@ func (b *Builder) makeFileInode(mode, uid, gid uint16, size uint64) Inode {
 	return inode
 }
 
+// initExtentHeader initializes the extent tree header in an inode's block array.
+// The extent header is stored in the first 12 bytes of the inode's block field
+// and contains metadata about the extent tree structure and depth.
 func (b *Builder) initExtentHeader(inode *Inode) {
 	for i := range inode.Block {
 		inode.Block[i] = 0
@@ -965,6 +593,9 @@ func (b *Builder) initExtentHeader(inode *Inode) {
 	binary.LittleEndian.PutUint32(inode.Block[8:12], 0) // generation
 }
 
+// setExtent sets a single extent mapping in an inode's extent tree.
+// Maps a contiguous range of logical blocks to physical blocks on disk.
+// Used for files that fit in a single extent or as part of a larger extent tree.
 func (b *Builder) setExtent(inode *Inode, logicalBlock, physicalBlock uint32, length uint16) {
 	binary.LittleEndian.PutUint16(inode.Block[2:4], 1)
 	binary.LittleEndian.PutUint32(inode.Block[12:16], logicalBlock)
@@ -973,7 +604,10 @@ func (b *Builder) setExtent(inode *Inode, logicalBlock, physicalBlock uint32, le
 	binary.LittleEndian.PutUint32(inode.Block[20:24], physicalBlock)
 }
 
-// setExtentMultiple handles non-contiguous blocks by creating multiple extents or extent tree
+// setExtentMultiple handles allocation of non-contiguous blocks by creating multiple extents.
+// For small numbers of blocks, creates individual extents. For larger allocations,
+// may create an indexed extent tree structure. Blocks should be physically contiguous
+// within each extent but may be sparse across extents.
 func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 	if len(blocks) == 0 {
 		return nil
@@ -1066,12 +700,18 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 	return nil
 }
 
+// writeInode writes an inode structure to its designated location in the inode table.
+// Inodes are stored in inode tables within their respective block groups.
+// The inode number determines which group and offset within the table to use.
 func (b *Builder) writeInode(inodeNum uint32, inode *Inode) {
 	var buf bytes.Buffer
 	binary.Write(&buf, binary.LittleEndian, inode)
 	b.disk.WriteAt(buf.Bytes(), int64(b.layout.InodeOffset(inodeNum)))
 }
 
+// readInode reads an inode structure from its location in the inode table.
+// Returns a pointer to the inode data, which can be used for reading file metadata
+// or modifying inode attributes. The inode number determines the group and offset.
 func (b *Builder) readInode(inodeNum uint32) *Inode {
 	buf := make([]byte, InodeSize)
 	b.disk.ReadAt(buf, int64(b.layout.InodeOffset(inodeNum)))
@@ -1081,6 +721,9 @@ func (b *Builder) readInode(inodeNum uint32) *Inode {
 	return inode
 }
 
+// incrementLinkCount increases the hard link count for the specified inode.
+// This is called when a directory entry is added that references the inode,
+// ensuring the link count accurately reflects the number of directory references.
 func (b *Builder) incrementLinkCount(inodeNum uint32) {
 	inode := b.readInode(inodeNum)
 	inode.LinksCount++
@@ -1091,6 +734,9 @@ func (b *Builder) incrementLinkCount(inodeNum uint32) {
 // Directory operations
 // ============================================================================
 
+// writeDirBlock writes a block containing directory entries to disk.
+// Directory entries are packed into the block with proper record length calculations
+// to ensure correct parsing. The block becomes part of the directory's data extent.
 func (b *Builder) writeDirBlock(blockNum uint32, entries []DirEntry) {
 	block := make([]byte, BlockSize)
 	offset := 0
@@ -1118,6 +764,9 @@ func (b *Builder) writeDirBlock(blockNum uint32, entries []DirEntry) {
 	b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum)))
 }
 
+// getInodeDataBlock returns the first data block number for a directory inode.
+// For directories, this is typically the block containing the "." and ".." entries.
+// Used for reading directory contents during operations like adding new entries.
 func (b *Builder) getInodeDataBlock(inodeNum uint32) uint32 {
 	inode := b.readInode(inodeNum)
 	blocks := b.getInodeBlocks(inode)
@@ -1127,6 +776,9 @@ func (b *Builder) getInodeDataBlock(inodeNum uint32) uint32 {
 	return blocks[0]
 }
 
+// getInodeBlocks extracts all block numbers referenced by an inode's extent tree.
+// Parses the extent structures to return a complete list of data blocks allocated
+// to the file or directory. Supports both simple extents and complex extent trees.
 func (b *Builder) getInodeBlocks(inode *Inode) []uint32 {
 	if (inode.Flags & InodeFlagExtents) == 0 {
 		return nil
@@ -1175,6 +827,9 @@ func (b *Builder) getInodeBlocks(inode *Inode) []uint32 {
 	return blocks
 }
 
+// addDirEntry adds a new directory entry to the specified directory.
+// Searches existing directory blocks for space, or allocates new blocks if needed.
+// Updates the directory's size and block allocation as entries are added.
 func (b *Builder) addDirEntry(dirInode uint32, entry DirEntry) error {
 	inode := b.readInode(dirInode)
 	dataBlocks := b.getInodeBlocks(inode)
@@ -1218,6 +873,9 @@ func (b *Builder) addDirEntry(dirInode uint32, entry DirEntry) error {
 	return nil
 }
 
+// tryAddEntryToBlock attempts to add a directory entry to an existing directory block.
+// Returns true if the entry fits in the available space, false if the block is full.
+// Calculates proper record lengths to maintain directory entry structure integrity.
 func (b *Builder) tryAddEntryToBlock(blockNum uint32, entry DirEntry, newRecLen int) bool {
 	block := make([]byte, BlockSize)
 	b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum)))
@@ -1260,6 +918,9 @@ func (b *Builder) tryAddEntryToBlock(blockNum uint32, entry DirEntry, newRecLen 
 	return true
 }
 
+// addBlockToInode adds a new block to a directory inode's extent tree.
+// Used when a directory grows beyond its current block allocation.
+// May convert from simple extents to indexed extents for large directories.
 func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
 	inode := b.readInode(inodeNum)
 
@@ -1309,6 +970,9 @@ func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
 	return nil
 }
 
+// convertToIndexedExtents converts a simple extent inode to use indexed extents.
+// Creates an extent index block to manage multiple extents efficiently.
+// Required when a file or directory exceeds the capacity of inline extent storage.
 func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 	inode := b.readInode(inodeNum)
 	entries := binary.LittleEndian.Uint16(inode.Block[2:4])
@@ -1358,6 +1022,9 @@ func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 	return nil
 }
 
+// addBlockToIndexedInode adds a new block to an inode that uses indexed extents.
+// Updates the extent index structure to include the new extent mapping.
+// Handles the complexity of maintaining sorted extent indices.
 func (b *Builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
 	inode := b.readInode(inodeNum)
 
@@ -1397,6 +1064,9 @@ func (b *Builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
 	return nil
 }
 
+// findEntry searches for a directory entry with the specified name.
+// Returns the inode number if found, or 0 if the entry doesn't exist.
+// Used to check for existing files before creation or overwriting.
 func (b *Builder) findEntry(dirInode uint32, name string) uint32 {
 	inode := b.readInode(dirInode)
 	dataBlocks := b.getInodeBlocks(inode)
@@ -1426,6 +1096,9 @@ func (b *Builder) findEntry(dirInode uint32, name string) uint32 {
 	return 0
 }
 
+// parseXattrName parses an extended attribute name into its namespace index and short name.
+// Extended attribute names use prefixes like "user.", "trusted.", etc.
+// Returns the namespace index, the name without prefix, and any parsing error.
 func parseXattrName(name string) (uint8, string, error) {
 	prefixes := []struct {
 		prefix string
@@ -1453,6 +1126,9 @@ func parseXattrName(name string) (uint8, string, error) {
 	return 0, "", fmt.Errorf("unknown xattr namespace in: %s", name)
 }
 
+// xattrIndexToPrefix converts an extended attribute namespace index to its string prefix.
+// Used when listing or displaying extended attribute names to users.
+// Returns the full prefix including the dot (e.g., "user.", "trusted.").
 func xattrIndexToPrefix(index uint8) string {
 	switch index {
 	case XattrIndexUser:
@@ -1472,6 +1148,10 @@ func xattrIndexToPrefix(index uint8) string {
 	}
 }
 
+// overwriteFile replaces the content of an existing file with new content.
+// Frees the old blocks and allocates new ones as needed for the new content size.
+// Updates the inode metadata while preserving the inode number.
+// Returns the inode number (same as input) on success.
 func (b *Builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid uint16) (uint32, error) {
 	// Read existing inode to get its blocks
 	oldInode := b.readInode(inodeNum)
@@ -1540,6 +1220,9 @@ func (b *Builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid 
 	return inodeNum, nil
 }
 
+// writeXattrBlock writes extended attribute entries to a dedicated block.
+// Extended attributes are stored in a special format with hash-based ordering
+// for efficient lookup. The block is referenced from the inode's FileACLLo field.
 func (b *Builder) writeXattrBlock(blockNum uint32, entries []XattrEntry) error {
 	block := make([]byte, BlockSize)
 
@@ -1616,6 +1299,9 @@ func (b *Builder) writeXattrBlock(blockNum uint32, entries []XattrEntry) error {
 	return nil
 }
 
+// readXattrBlock reads extended attribute entries from a dedicated block.
+// Parses the special xattr block format to extract name-value pairs.
+// Returns a slice of XattrEntry structures for further processing.
 func (b *Builder) readXattrBlock(blockNum uint32) []XattrEntry {
 	block := make([]byte, BlockSize)
 	b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum)))
@@ -1668,7 +1354,9 @@ func (b *Builder) readXattrBlock(blockNum uint32) []XattrEntry {
 	return entries
 }
 
-// xattrEntryHash calculates the combined hash for an entry
+// xattrEntryHash calculates a hash for an extended attribute entry.
+// The hash is used for ordering entries in the xattr block for efficient lookup.
+// Combines the namespace index, name, and value into a single hash value.
 func xattrEntryHash(nameIndex uint8, name string, value []byte) uint32 {
 	const nameHashShift = 5
 	const valueHashShift = 16
@@ -1697,7 +1385,9 @@ func xattrEntryHash(nameIndex uint8, name string, value []byte) uint32 {
 	return hash
 }
 
-// xattrBlockHash calculates the block hash from all entry hashes
+// xattrBlockHash calculates a verification hash for the entire xattr block.
+// Used to detect corruption or tampering of extended attribute data.
+// The hash is stored in the xattr block header for integrity checking.
 func xattrBlockHash(entryHashes []uint32) uint32 {
 	const blockHashShift = 16
 

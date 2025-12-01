@@ -25,14 +25,17 @@ const (
 	partitionOffset = 1048576
 )
 
-// testContext holds resources for a single test case
+// testContext holds resources and state for a single end-to-end test case.
+// Manages the temporary image file and Ext4ImageBuilder instance for testing.
 type testContext struct {
 	t         *testing.T
 	imagePath string
 	builder   *ext4fs.Ext4ImageBuilder
 }
 
-// newTestContext creates a new test context with a temporary image file
+// newTestContext creates a new test context with a temporary image file and builder.
+// Enables debug output during testing and sets up all necessary resources.
+// The temporary directory and files are automatically cleaned up after the test.
 func newTestContext(t *testing.T, sizeMB int) *testContext {
 	t.Helper()
 
@@ -55,7 +58,9 @@ func newTestContext(t *testing.T, sizeMB int) *testContext {
 	}
 }
 
-// finalize prepares the filesystem and saves the image
+// finalize prepares the filesystem for use by updating metadata and saving the image.
+// Calls FinalizeMetadata to update block/inode counts, saves pending writes,
+// and closes the builder. The image file is then ready for mounting and testing.
 func (tc *testContext) finalize() {
 	tc.t.Helper()
 	tc.builder.FinalizeMetadata()
@@ -65,8 +70,10 @@ func (tc *testContext) finalize() {
 	require.NoError(tc.t, err, "failed to close builder")
 }
 
-// dockerExec runs a command inside a privileged Docker container with the image mounted
-// Returns stdout, stderr, and any error
+// dockerExec runs commands inside a privileged Docker container with the ext4 image mounted.
+// The container extracts the partition from the image, runs e2fsck for validation,
+// mounts the filesystem, executes the provided commands, and returns their output.
+// This provides end-to-end validation that the generated filesystem is correct.
 func (tc *testContext) dockerExec(commands ...string) (string, string, error) {
 	tc.t.Helper()
 
@@ -124,7 +131,9 @@ umount /mnt/ext4
 	return stdout.String(), stderr.String(), err
 }
 
-// dockerExecSimple runs commands and returns combined output, failing the test on error
+// dockerExecSimple runs commands in Docker and returns combined stdout/stderr output.
+// Fails the test immediately if any command returns an error.
+// Simplifies test code by handling error checking internally.
 func (tc *testContext) dockerExecSimple(commands ...string) string {
 	tc.t.Helper()
 	stdout, stderr, err := tc.dockerExec(commands...)
@@ -134,7 +143,8 @@ func (tc *testContext) dockerExecSimple(commands ...string) string {
 	return stdout
 }
 
-// skipIfNoDocker skips the test if Docker is not available
+// skipIfNoDocker skips the test if Docker is not available or not running.
+// End-to-end tests require Docker to mount and validate the generated ext4 images.
 func skipIfNoDocker(t *testing.T) {
 	t.Helper()
 	cmd := exec.Command("docker", "info")
@@ -143,7 +153,9 @@ func skipIfNoDocker(t *testing.T) {
 	}
 }
 
-// TestBasicFilesystemCreation verifies that a basic ext4 filesystem can be created and mounted
+// TestBasicFilesystemCreation verifies that a basic ext4 filesystem can be created and mounted.
+// Tests the fundamental filesystem creation functionality including root directory
+// and lost+found directory creation, ensuring the image can be mounted successfully.
 func TestBasicFilesystemCreation(t *testing.T) {
 	skipIfNoDocker(t)
 
@@ -160,7 +172,9 @@ func TestBasicFilesystemCreation(t *testing.T) {
 	assert.Contains(t, output, "lost+found exists")
 }
 
-// TestFileCreation tests creating files with various sizes and contents
+// TestFileCreation tests creating files with various sizes, contents, permissions, and ownership.
+// Verifies that files are correctly written to the filesystem and can be read back
+// with proper attributes preserved. Tests edge cases like empty files and special characters.
 func TestFileCreation(t *testing.T) {
 	skipIfNoDocker(t)
 
@@ -258,7 +272,9 @@ func TestFileCreation(t *testing.T) {
 	}
 }
 
-// TestFileOverwriting tests overwriting files with new content, permissions, and ownership
+// TestFileOverwriting tests overwriting existing files with new content, permissions, and ownership.
+// Verifies that the filesystem correctly handles file replacement, block deallocation,
+// and metadata updates when files are overwritten with different sizes.
 func TestFileOverwriting(t *testing.T) {
 	skipIfNoDocker(t)
 
