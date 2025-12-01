@@ -2,8 +2,6 @@ package ext4fs
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -11,8 +9,8 @@ import (
 // It wraps the internal Builder with file-based storage and provides high-level
 // methods for filesystem construction, metadata management, and image persistence.
 type Image struct {
-	builder *builder     // Internal filesystem builder
-	backend *fileBackend // File-based storage backend
+	builder *builder    // Internal filesystem builder
+	backend diskBackend // File-based storage backend
 
 	imagePath string // Path to the output image file
 	sizeBytes uint64 // Image size in Bytes
@@ -28,11 +26,9 @@ func New(opts ...ImageOption) (*Image, error) {
 		createdAt: uint32(time.Now().Unix()),
 	}
 	for _, opt := range opts {
-		opt(img)
-	}
-
-	if img.imagePath == "" {
-		return nil, fmt.Errorf("imagePath is required")
+		if err := opt(img); err != nil {
+			return nil, err
+		}
 	}
 
 	if img.sizeBytes < 4*1024*1024 {
@@ -42,37 +38,18 @@ func New(opts ...ImageOption) (*Image, error) {
 	partitionStart := uint64(0) // 0 offset for raw ext4
 	partitionSize := img.sizeBytes - partitionStart
 
-	// Create directory if needed
-	dir := filepath.Dir(img.imagePath)
-	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
-		}
-	}
-
-	// Create/truncate file
-	f, err := os.OpenFile(img.imagePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open image file %s: %w", img.imagePath, err)
-	}
-
-	if err := f.Truncate(int64(img.sizeBytes)); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("failed to truncate image file: %w", err)
-	}
-
-	backend := &fileBackend{f: f}
-
 	// Calculate layout
 	layout, err := CalculateLayout(partitionStart, partitionSize, img.createdAt)
 	if err != nil {
-		_ = f.Close()
 		return nil, err
 	}
 
-	img.builder = newBuilder(backend, layout)
+	img.builder = newBuilder(img.backend, layout)
 
-	img.backend = backend
+	if err := img.backend.truncate(int64(img.sizeBytes)); err != nil {
+		return nil, fmt.Errorf("failed to truncate image file: %w", err)
+	}
+
 	if err := img.builder.prepareFilesystem(); err != nil {
 		return nil, fmt.Errorf("failed to prepare filesystem: %w", err)
 	}

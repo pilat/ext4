@@ -2,21 +2,30 @@
 // It allows building ext4 filesystems programmatically without external dependencies,
 // suitable for creating disk images for virtual machines, containers, or embedded systems.
 //
-// The main entry point is Ext4ImageBuilder in disk.go, which provides a high-level API
-// for creating and managing ext4 images. The internal Builder handles the low-level
-// filesystem construction details.
+// The main entry point is Image in image.go, constructed via New and configured with
+// ImageOption helpers from opts.go. Image wraps an internal builder that handles the
+// low-level ext4 on-disk layout and metadata updates.
 //
 // Example usage:
 //
-//	builder, err := ext4fs.New(ext4fs.WithImagePath("disk.img"), ext4fs.WithSize(64))
+//	img, err := ext4fs.New(
+//		ext4fs.WithImagePath("disk.img"),
+//		ext4fs.WithSizeInMB(64),
+//	)
 //	if err != nil {
 //		panic(err)
 //	}
 //
-//	builder.PrepareFilesystem()
-//	rootDir := builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
-//	builder.CreateFile(rootDir, "hostname", []byte("myhost\n"), 0644, 0, 0)
-//	if err := builder.Save(); err != nil {
+//	rootDir, err := img.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
+//	if err != nil {
+//		panic(err)
+//	}
+//
+//	if _, err := img.CreateFile(rootDir, "hostname", []byte("myhost\n"), 0644, 0, 0); err != nil {
+//		panic(err)
+//	}
+//
+//	if err := img.Save(); err != nil {
 //		panic(err)
 //	}
 package ext4fs
@@ -114,6 +123,13 @@ const (
 	// Xattr block layout
 	xAttrHeaderSize      = 32
 	xAttrEntryHeaderSize = 16
+
+	// Xattr hashing parameters (must match kernel algorithms)
+	xattrNameHashShift  = 5
+	xattrValueHashShift = 16
+	xattrRound          = 3
+	xattrPadBits        = 2
+	xattrBlockHashShift = 16
 )
 
 // ============================================================================

@@ -277,17 +277,10 @@ func (b *builder) readXattrBlock(blockNum uint32) ([]xAttrEntry, error) {
 // The hash is used for ordering entries in the xattr block for efficient lookup.
 // Combines the namespace index, name, and value into a single hash value.
 func xattrEntryHash(nameIndex uint8, name string, value []byte) uint32 {
-	const (
-		nameHashShift  = 5
-		valueHashShift = 16
-		xattrRound     = 3
-		xattrPadBits   = 2
-	)
-
 	// First compute name hash
 	hash := uint32(0)
 	for _, c := range []byte(name) {
-		hash = (hash << nameHashShift) ^ (hash >> (32 - nameHashShift)) ^ uint32(c)
+		hash = (hash << xattrNameHashShift) ^ (hash >> (32 - xattrNameHashShift)) ^ uint32(c)
 	}
 
 	// Continue (not XOR!) with value hash
@@ -301,7 +294,7 @@ func xattrEntryHash(nameIndex uint8, name string, value []byte) uint32 {
 				word |= uint32(value[offset+j]) << (j * 8)
 			}
 
-			hash = (hash << valueHashShift) ^ (hash >> (32 - valueHashShift)) ^ word
+			hash = (hash << xattrValueHashShift) ^ (hash >> (32 - xattrValueHashShift)) ^ word
 		}
 	}
 
@@ -312,8 +305,6 @@ func xattrEntryHash(nameIndex uint8, name string, value []byte) uint32 {
 // Used to detect corruption or tampering of extended attribute data.
 // The hash is stored in the xattr block header for integrity checking.
 func xattrBlockHash(entryHashes []uint32) uint32 {
-	const blockHashShift = 16
-
 	hash := uint32(0)
 
 	for _, entryHash := range entryHashes {
@@ -321,7 +312,7 @@ func xattrBlockHash(entryHashes []uint32) uint32 {
 			return 0
 		}
 
-		hash = (hash << blockHashShift) ^ (hash >> (32 - blockHashShift)) ^ entryHash
+		hash = (hash << xattrBlockHashShift) ^ (hash >> (32 - xattrBlockHashShift)) ^ entryHash
 	}
 
 	return hash

@@ -19,6 +19,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 const (
 	// Docker image to use for ext4 validation
 	dockerImage = "alpine:latest"
@@ -30,152 +34,132 @@ const (
 	// Fixture settings for deterministic full-features image
 	fixtureSizeMB     = 64
 	fixturesCreatedAt = uint32(1600000000)
-	expectedSHA256Hex = "b151e41a072581c31ddfc09992c272b6fd4e631aac3163eec7814212e82678a7"
+	expectedSHA256Hex = "391d60c1629a4062d7b922da1083b1b0db6bcc624fdf3310db785f2634044025"
+
+	// Directory inside the Docker container where host images are mounted.
+	sharedContainerDir = "/ext4-images"
 )
 
-// testContext holds resources and state for a single end-to-end test case.
-// Manages the temporary image file and Ext4ImageBuilder instance for testing.
-type testContext struct {
-	t         *testing.T
-	imagePath string
-	builder   *ext4fs.Image
-}
+// =============================================================================
+// Package State
+// =============================================================================
 
-// newTestContext creates a new test context with a temporary image file and builder.
-// Enables debug output during testing and sets up all necessary resources.
-// The temporary directory and files are automatically cleaned up after the test.
-func newTestContext(t *testing.T, sizeMB int) *testContext {
-	t.Helper()
+var (
+	dockerContainerID string
+	dockerAvailable   bool
+	sharedHostDir     string
+)
 
-	prevDebug := ext4fs.DEBUG
-	ext4fs.DEBUG = true
+// =============================================================================
+// Test Main
+// =============================================================================
 
-	defer func() {
-		ext4fs.DEBUG = prevDebug
-	}()
-
-	tmpDir := t.TempDir()
-	imagePath := filepath.Join(tmpDir, "test.img")
-
-	builder, err := ext4fs.New(ext4fs.WithImagePath(imagePath), ext4fs.WithSizeInMB(sizeMB))
-	require.NoError(t, err, "failed to create ext4 image builder")
-
-	return &testContext{
-		t:         t,
-		imagePath: imagePath,
-		builder:   builder,
+// TestMain sets up a single long-lived Docker container that is reused by all
+// end-to-end tests. The container is stopped and removed once all tests
+// complete. If Docker is not available, all tests in this package are
+// effectively skipped.
+func TestMain(m *testing.M) {
+	// Do not run docker for benchmarks
+	benchOnly := false
+	for _, arg := range os.Args {
+		if strings.Contains(arg, "-test.bench") {
+			benchOnly = true
+			break
+		}
 	}
-}
+	if benchOnly {
+		code := m.Run()
+		os.Exit(code)
+	}
 
-// finalize prepares the filesystem for use by updating metadata and saving the image.
-// Calls FinalizeMetadata to update block/inode counts, saves pending writes,
-// and closes the builder. The image file is then ready for mounting and testing.
-func (tc *testContext) finalize() {
-	tc.t.Helper()
-	err := tc.builder.Save()
-	require.NoError(tc.t, err, "failed to save image")
-	err = tc.builder.Close()
-	require.NoError(tc.t, err, "failed to close builder")
-}
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "Docker not available, skipping e2e tests")
+		os.Exit(0)
+	}
 
-// dockerExec runs commands inside a privileged Docker container with the ext4 image mounted.
-// The container runs e2fsck for validation on the raw ext4 image, mounts the filesystem,
-// executes the provided commands, and returns their output. This provides end-to-end
-// validation that the generated filesystem is correct.
-func (tc *testContext) dockerExec(commands ...string) (string, string, error) {
-	tc.t.Helper()
+	dockerAvailable = true
 
-	script := fmt.Sprintf(`
-set -e
-apk add --no-cache e2fsprogs > /dev/null 2>&1
-
-# Copy image to container filesystem
-cp /image/test.img /tmp/fs.img
-
-# Check filesystem (raw ext4 image, no partition table)
-e2fsck -n -f /tmp/fs.img || { echo "e2fsck failed"; exit 1; }
-
-# Mount the filesystem
-mkdir -p /mnt/ext4
-mount -t ext4 -o loop /tmp/fs.img /mnt/ext4
-
-# Run the verification commands
-cd /mnt/ext4
-%s
-
-# Cleanup
-cd /
-umount /mnt/ext4
-`, strings.Join(commands, "\n"))
-
-	absPath, err := filepath.Abs(filepath.Dir(tc.imagePath))
+	dir, err := os.MkdirTemp("", "ext4fs-e2e-")
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get absolute path: %w", err)
+		fmt.Fprintln(os.Stderr, "failed to create shared host dir for e2e tests:", err)
+		os.Exit(1)
 	}
+	sharedHostDir = dir
 
-	args := []string{
-		"run", "--rm", "--privileged",
-		"-v", fmt.Sprintf("%s:/image:ro", absPath),
-		dockerImage,
-		"sh", "-c", script,
-	}
-
-	// Use a context with timeout to prevent hanging
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "docker", args...)
-
-	var stdout, stderr bytes.Buffer
-
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err = cmd.Run()
-
-	if ctx.Err() == context.DeadlineExceeded {
-		return stdout.String(), stderr.String(), fmt.Errorf("docker command timed out after 60s")
-	}
-
-	return stdout.String(), stderr.String(), err
-}
-
-// dockerExecSimple runs commands in Docker and returns combined stdout/stderr output.
-// Fails the test immediately if any command returns an error.
-// Simplifies test code by handling error checking internally.
-func (tc *testContext) dockerExecSimple(commands ...string) string {
-	tc.t.Helper()
-
-	stdout, stderr, err := tc.dockerExec(commands...)
+	id, err := startDockerContainer()
 	if err != nil {
-		tc.t.Fatalf("docker exec failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		fmt.Fprintln(os.Stderr, "failed to start Docker container for e2e tests:", err)
+		os.Exit(1)
+	}
+	dockerContainerID = strings.TrimSpace(id)
+
+	code := m.Run()
+
+	if dockerContainerID != "" {
+		stopDockerContainer(dockerContainerID)
+	}
+	if sharedHostDir != "" {
+		_ = os.RemoveAll(sharedHostDir)
 	}
 
-	return stdout
+	os.Exit(code)
 }
 
-// skipIfNoDocker skips the test if Docker is not available or not running.
-// End-to-end tests require Docker to mount and validate the generated ext4 images.
-func skipIfNoDocker(t *testing.T) {
-	t.Helper()
+// =============================================================================
+// End-to-End Tests
+// =============================================================================
 
-	cmd := exec.Command("docker", "info")
-	if err := cmd.Run(); err != nil {
-		t.Skip("Docker not available, skipping e2e test")
-	}
-}
-
-// TestBasicFilesystemCreation verifies that a basic ext4 filesystem can be created and mounted.
-// Tests the fundamental filesystem creation functionality including root directory
-// and lost+found directory creation, ensuring the image can be mounted successfully.
-func TestBasicFilesystemCreation(t *testing.T) {
+func TestExt4FS(t *testing.T) {
 	skipIfNoDocker(t)
 
-	tc := newTestContext(t, defaultImageSizeMB)
-	tc.finalize()
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"BasicFilesystemCreation", testBasicFilesystemCreation},
+		{"FileCreation", testFileCreation},
+		{"FileOverwriting", testFileOverwriting},
+		{"MultipleFileOverwrites", testMultipleFileOverwrites},
+		{"OverwriteInSubdirectory", testOverwriteInSubdirectory},
+		{"DirectoryCreation", testDirectoryCreation},
+		{"SymlinkCreation", testSymlinkCreation},
+		{"ComplexFilesystem", testComplexFilesystem},
+		{"LargeFile", testLargeFile},
+		{"FilesystemIntegrity", testFilesystemIntegrity},
+		{"DifferentImageSizes", testDifferentImageSizes},
+		{"FilesystemStatistics", testFilesystemStatistics},
+		{"SpecialFileNames", testSpecialFileNames},
+		{"MultiBlockDirectory", testMultiBlockDirectory},
+		{"MultiBlockDirectoryWithSymlinks", testMultiBlockDirectoryWithSymlinks},
+		{"MultiBlockDirectoryNested", testMultiBlockDirectoryNested},
+		{"ExtentTreeConversion", testExtentTreeConversion},
+		{"XattrBasic", testXattrBasic},
+		{"XattrSELinux", testXattrSELinux},
+		{"XattrMultiple", testXattrMultiple},
+		{"XattrOnDirectory", testXattrOnDirectory},
+		{"XattrOverwrite", testXattrOverwrite},
+		{"XattrLargeValue", testXattrLargeValue},
+		{"XattrWithFileOverwrite", testXattrWithFileOverwrite},
+		{"XattrSymlink", testXattrSymlink},
+		{"XattrCapabilities", testXattrCapabilities},
+		{"XattrRemove", testXattrRemove},
+		{"XattrList", testXattrList},
+		{"XattrComplexFilesystem", testXattrComplexFilesystem},
+		{"XattrManyFiles", testXattrManyFiles},
+		{"XattrEmpty", testXattrEmpty},
+		{"XattrPosixACL", testXattrPosixACL},
+	}
 
-	// Verify the filesystem can be mounted and has basic structure
-	output := tc.dockerExecSimple(
+	for _, tc := range tests {
+		t.Run(tc.name, tc.run)
+	}
+}
+
+func testBasicFilesystemCreation(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+	env.finalize()
+
+	output := env.dockerExecSimple(
 		`ls -la`,
 		`test -d "lost+found" && echo "lost+found exists"`,
 	)
@@ -183,12 +167,7 @@ func TestBasicFilesystemCreation(t *testing.T) {
 	assert.Contains(t, output, "lost+found exists")
 }
 
-// TestFileCreation tests creating files with various sizes, contents, permissions, and ownership.
-// Verifies that files are correctly written to the filesystem and can be read back
-// with proper attributes preserved. Tests edge cases like empty files and special characters.
-func TestFileCreation(t *testing.T) {
-	skipIfNoDocker(t)
-
+func testFileCreation(t *testing.T) {
 	testCases := []struct {
 		name     string
 		filename string
@@ -249,47 +228,36 @@ func TestFileCreation(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := newTestContext(t, defaultImageSizeMB)
+			env := newTestEnv(t, defaultImageSizeMB)
 
-			ctx.builder.CreateFile(ext4fs.RootInode, tc.filename, []byte(tc.content), tc.mode, tc.uid, tc.gid)
+			_, err := env.builder.CreateFile(ext4fs.RootInode, tc.filename, []byte(tc.content), tc.mode, tc.uid, tc.gid)
+			require.NoError(t, err)
+			env.finalize()
 
-			ctx.finalize()
-
-			// Verify file exists and has correct content
 			commands := []string{
 				fmt.Sprintf(`test -f "%s" && echo "file exists"`, tc.filename),
 			}
-
 			if tc.content != "" {
 				commands = append(commands, fmt.Sprintf(`cat "%s"`, tc.filename))
 			}
+			commands = append(commands,
+				fmt.Sprintf(`stat -c "%%a" "%s"`, tc.filename),
+				fmt.Sprintf(`stat -c "%%u:%%g" "%s"`, tc.filename),
+			)
 
-			// Check permissions (convert to octal string)
-			commands = append(commands, fmt.Sprintf(`stat -c "%%a" "%s"`, tc.filename))
-
-			// Check ownership
-			commands = append(commands, fmt.Sprintf(`stat -c "%%u:%%g" "%s"`, tc.filename))
-
-			output := ctx.dockerExecSimple(commands...)
+			output := env.dockerExecSimple(commands...)
 
 			assert.Contains(t, output, "file exists")
-
 			if tc.content != "" {
 				assert.Contains(t, output, tc.content)
 			}
-
 			assert.Contains(t, output, fmt.Sprintf("%o", tc.mode))
 			assert.Contains(t, output, fmt.Sprintf("%d:%d", tc.uid, tc.gid))
 		})
 	}
 }
 
-// TestFileOverwriting tests overwriting existing files with new content, permissions, and ownership.
-// Verifies that the filesystem correctly handles file replacement, block deallocation,
-// and metadata updates when files are overwritten with different sizes.
-func TestFileOverwriting(t *testing.T) {
-	skipIfNoDocker(t)
-
+func testFileOverwriting(t *testing.T) {
 	testCases := []struct {
 		name            string
 		originalContent string
@@ -382,65 +350,51 @@ func TestFileOverwriting(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := newTestContext(t, defaultImageSizeMB)
+			env := newTestEnv(t, defaultImageSizeMB)
 
 			filename := "testfile.txt"
 
-			// Create original file
-			ctx.builder.CreateFile(ext4fs.RootInode, filename, []byte(tc.originalContent), tc.originalMode, tc.originalUID, tc.originalGID)
+			_, err := env.builder.CreateFile(ext4fs.RootInode, filename, []byte(tc.originalContent), tc.originalMode, tc.originalUID, tc.originalGID)
+			require.NoError(t, err)
+			_, err = env.builder.CreateFile(ext4fs.RootInode, filename, []byte(tc.newContent), tc.newMode, tc.newUID, tc.newGID)
+			require.NoError(t, err)
+			env.finalize()
 
-			// Overwrite the file
-			ctx.builder.CreateFile(ext4fs.RootInode, filename, []byte(tc.newContent), tc.newMode, tc.newUID, tc.newGID)
-
-			ctx.finalize()
-
-			// Verify file exists with new content, permissions, and ownership
 			commands := []string{
 				fmt.Sprintf(`test -f "%s" && echo "file exists"`, filename),
 			}
-
 			if tc.newContent != "" {
 				commands = append(commands, fmt.Sprintf(`cat "%s"`, filename))
 			} else {
-				// For empty files, check size is 0
 				commands = append(commands, fmt.Sprintf(`[ $(stat -c %%s "%s") -eq 0 ] && echo "file is empty"`, filename))
 			}
+			commands = append(commands,
+				fmt.Sprintf(`stat -c "%%a" "%s"`, filename),
+				fmt.Sprintf(`stat -c "%%u:%%g" "%s"`, filename),
+			)
 
-			// Check permissions
-			commands = append(commands, fmt.Sprintf(`stat -c "%%a" "%s"`, filename))
-
-			// Check ownership
-			commands = append(commands, fmt.Sprintf(`stat -c "%%u:%%g" "%s"`, filename))
-
-			output := ctx.dockerExecSimple(commands...)
+			output := env.dockerExecSimple(commands...)
 
 			assert.Contains(t, output, "file exists")
-
 			if tc.newContent != "" {
 				assert.Contains(t, output, tc.newContent)
-				// Only check that original content is not present if it's different from new content
 				if tc.originalContent != tc.newContent && tc.originalContent != "" {
 					assert.NotContains(t, output, tc.originalContent, "should not contain original content")
 				}
 			} else {
 				assert.Contains(t, output, "file is empty")
 			}
-
 			assert.Contains(t, output, fmt.Sprintf("%o", tc.newMode))
 			assert.Contains(t, output, fmt.Sprintf("%d:%d", tc.newUID, tc.newGID))
 		})
 	}
 }
 
-// TestMultipleFileOverwrites tests overwriting the same file multiple times
-func TestMultipleFileOverwrites(t *testing.T) {
-	skipIfNoDocker(t)
-
-	ctx := newTestContext(t, defaultImageSizeMB)
+func testMultipleFileOverwrites(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
 	filename := "multi-overwrite.txt"
 
-	// Create and overwrite the file multiple times
 	contents := []string{
 		"First version",
 		"Second version - longer content",
@@ -448,19 +402,17 @@ func TestMultipleFileOverwrites(t *testing.T) {
 		"Fourth version with even more content than before",
 		"Final version",
 	}
-
 	modes := []uint16{0644, 0600, 0755, 0400, 0777}
 	uids := []uint16{0, 1000, 500, 0, 1001}
 	gids := []uint16{0, 1000, 500, 0, 1001}
 
 	for i, content := range contents {
-		ctx.builder.CreateFile(ext4fs.RootInode, filename, []byte(content), modes[i], uids[i], gids[i])
+		_, err := env.builder.CreateFile(ext4fs.RootInode, filename, []byte(content), modes[i], uids[i], gids[i])
+		require.NoError(t, err)
 	}
+	env.finalize()
 
-	ctx.finalize()
-
-	// Verify only the final version is present
-	output := ctx.dockerExecSimple(
+	output := env.dockerExecSimple(
 		fmt.Sprintf(`test -f "%s" && echo "file exists"`, filename),
 		fmt.Sprintf(`cat "%s"`, filename),
 		fmt.Sprintf(`stat -c "%%a" "%s"`, filename),
@@ -469,37 +421,28 @@ func TestMultipleFileOverwrites(t *testing.T) {
 
 	assert.Contains(t, output, "file exists")
 	assert.Contains(t, output, contents[len(contents)-1])
-	// Should not contain earlier versions
 	for i := 0; i < len(contents)-1; i++ {
 		assert.NotContains(t, output, contents[i])
 	}
-
 	assert.Contains(t, output, fmt.Sprintf("%o", modes[len(modes)-1]))
 	assert.Contains(t, output, fmt.Sprintf("%d:%d", uids[len(uids)-1], gids[len(gids)-1]))
 }
 
-// TestOverwriteInSubdirectory tests overwriting files in subdirectories
-func TestOverwriteInSubdirectory(t *testing.T) {
-	skipIfNoDocker(t)
+func testOverwriteInSubdirectory(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	// Create a subdirectory
-	subdir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+	subdir, err := env.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
 	require.NoError(t, err)
 
 	filename := "file.txt"
 
-	// Create original file in subdirectory
-	ctx.builder.CreateFile(subdir, filename, []byte("original content"), 0644, 0, 0)
+	_, err = env.builder.CreateFile(subdir, filename, []byte("original content"), 0644, 0, 0)
+	require.NoError(t, err)
+	_, err = env.builder.CreateFile(subdir, filename, []byte("new content"), 0600, 1000, 1000)
+	require.NoError(t, err)
+	env.finalize()
 
-	// Overwrite the file
-	ctx.builder.CreateFile(subdir, filename, []byte("new content"), 0600, 1000, 1000)
-
-	ctx.finalize()
-
-	// Verify the overwritten file
-	output := ctx.dockerExecSimple(
+	output := env.dockerExecSimple(
 		`test -f "subdir/file.txt" && echo "file exists"`,
 		`cat "subdir/file.txt"`,
 		`stat -c "%a" "subdir/file.txt"`,
@@ -513,20 +456,18 @@ func TestOverwriteInSubdirectory(t *testing.T) {
 	assert.Contains(t, output, "1000:1000")
 }
 
-// TestDirectoryCreation tests creating directories with various structures
-func TestDirectoryCreation(t *testing.T) {
-	skipIfNoDocker(t)
-
+func testDirectoryCreation(t *testing.T) {
 	testCases := []struct {
 		name      string
-		structure func(b *ext4fs.Image)
+		structure func(t *testing.T, b *ext4fs.Image)
 		verify    []string
 		expects   []string
 	}{
 		{
 			name: "single directory",
-			structure: func(b *ext4fs.Image) {
-				b.CreateDirectory(ext4fs.RootInode, "mydir", 0755, 0, 0)
+			structure: func(t *testing.T, b *ext4fs.Image) {
+				_, err := b.CreateDirectory(ext4fs.RootInode, "mydir", 0755, 0, 0)
+				require.NoError(t, err)
 			},
 			verify: []string{
 				`test -d "mydir" && echo "mydir is directory"`,
@@ -536,12 +477,13 @@ func TestDirectoryCreation(t *testing.T) {
 		},
 		{
 			name: "nested directories",
-			structure: func(b *ext4fs.Image) {
+			structure: func(t *testing.T, b *ext4fs.Image) {
 				dir1, err := b.CreateDirectory(ext4fs.RootInode, "level1", 0755, 0, 0)
 				require.NoError(t, err)
 				dir2, err := b.CreateDirectory(dir1, "level2", 0755, 0, 0)
 				require.NoError(t, err)
-				b.CreateDirectory(dir2, "level3", 0755, 0, 0)
+				_, err = b.CreateDirectory(dir2, "level3", 0755, 0, 0)
+				require.NoError(t, err)
 			},
 			verify: []string{
 				`test -d "level1/level2/level3" && echo "nested dirs exist"`,
@@ -550,8 +492,9 @@ func TestDirectoryCreation(t *testing.T) {
 		},
 		{
 			name: "directory with sticky bit",
-			structure: func(b *ext4fs.Image) {
-				b.CreateDirectory(ext4fs.RootInode, "tmp", 0777|stickyBit, 0, 0)
+			structure: func(t *testing.T, b *ext4fs.Image) {
+				_, err := b.CreateDirectory(ext4fs.RootInode, "tmp", 0777|stickyBit, 0, 0)
+				require.NoError(t, err)
 			},
 			verify: []string{
 				`test -d "tmp" && echo "tmp exists"`,
@@ -561,8 +504,9 @@ func TestDirectoryCreation(t *testing.T) {
 		},
 		{
 			name: "directory with custom ownership",
-			structure: func(b *ext4fs.Image) {
-				b.CreateDirectory(ext4fs.RootInode, "userdir", 0750, 1000, 1000)
+			structure: func(t *testing.T, b *ext4fs.Image) {
+				_, err := b.CreateDirectory(ext4fs.RootInode, "userdir", 0750, 1000, 1000)
+				require.NoError(t, err)
 			},
 			verify: []string{
 				`stat -c "%u:%g" "userdir"`,
@@ -572,11 +516,15 @@ func TestDirectoryCreation(t *testing.T) {
 		},
 		{
 			name: "multiple directories at same level",
-			structure: func(b *ext4fs.Image) {
-				b.CreateDirectory(ext4fs.RootInode, "bin", 0755, 0, 0)
-				b.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
-				b.CreateDirectory(ext4fs.RootInode, "home", 0755, 0, 0)
-				b.CreateDirectory(ext4fs.RootInode, "var", 0755, 0, 0)
+			structure: func(t *testing.T, b *ext4fs.Image) {
+				_, err := b.CreateDirectory(ext4fs.RootInode, "bin", 0755, 0, 0)
+				require.NoError(t, err)
+				_, err = b.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
+				require.NoError(t, err)
+				_, err = b.CreateDirectory(ext4fs.RootInode, "home", 0755, 0, 0)
+				require.NoError(t, err)
+				_, err = b.CreateDirectory(ext4fs.RootInode, "var", 0755, 0, 0)
+				require.NoError(t, err)
 			},
 			verify: []string{
 				`ls -1d bin etc home var | wc -l | tr -d ' '`,
@@ -587,11 +535,11 @@ func TestDirectoryCreation(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := newTestContext(t, defaultImageSizeMB)
-			tc.structure(ctx.builder)
-			ctx.finalize()
+			env := newTestEnv(t, defaultImageSizeMB)
+			tc.structure(t, env.builder)
+			env.finalize()
 
-			output := ctx.dockerExecSimple(tc.verify...)
+			output := env.dockerExecSimple(tc.verify...)
 
 			for _, expected := range tc.expects {
 				assert.Contains(t, output, expected)
@@ -600,21 +548,20 @@ func TestDirectoryCreation(t *testing.T) {
 	}
 }
 
-// TestSymlinkCreation tests creating symbolic links
-func TestSymlinkCreation(t *testing.T) {
-	skipIfNoDocker(t)
-
+func testSymlinkCreation(t *testing.T) {
 	testCases := []struct {
 		name    string
-		setup   func(b *ext4fs.Image)
+		setup   func(t *testing.T, b *ext4fs.Image)
 		verify  []string
 		expects []string
 	}{
 		{
 			name: "simple symlink to file",
-			setup: func(b *ext4fs.Image) {
-				b.CreateFile(ext4fs.RootInode, "original.txt", []byte("original content"), 0644, 0, 0)
-				b.CreateSymlink(ext4fs.RootInode, "link.txt", "original.txt", 0, 0)
+			setup: func(t *testing.T, b *ext4fs.Image) {
+				_, err := b.CreateFile(ext4fs.RootInode, "original.txt", []byte("original content"), 0644, 0, 0)
+				require.NoError(t, err)
+				_, err = b.CreateSymlink(ext4fs.RootInode, "link.txt", "original.txt", 0, 0)
+				require.NoError(t, err)
 			},
 			verify: []string{
 				`test -L "link.txt" && echo "is symlink"`,
@@ -625,11 +572,13 @@ func TestSymlinkCreation(t *testing.T) {
 		},
 		{
 			name: "symlink to directory",
-			setup: func(b *ext4fs.Image) {
+			setup: func(t *testing.T, b *ext4fs.Image) {
 				dir, err := b.CreateDirectory(ext4fs.RootInode, "realdir", 0755, 0, 0)
 				require.NoError(t, err)
-				b.CreateFile(dir, "file.txt", []byte("in dir"), 0644, 0, 0)
-				b.CreateSymlink(ext4fs.RootInode, "linkdir", "realdir", 0, 0)
+				_, err = b.CreateFile(dir, "file.txt", []byte("in dir"), 0644, 0, 0)
+				require.NoError(t, err)
+				_, err = b.CreateSymlink(ext4fs.RootInode, "linkdir", "realdir", 0, 0)
+				require.NoError(t, err)
 			},
 			verify: []string{
 				`test -L "linkdir" && echo "is symlink"`,
@@ -639,11 +588,13 @@ func TestSymlinkCreation(t *testing.T) {
 		},
 		{
 			name: "relative symlink",
-			setup: func(b *ext4fs.Image) {
+			setup: func(t *testing.T, b *ext4fs.Image) {
 				dir, err := b.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
 				require.NoError(t, err)
-				b.CreateFile(ext4fs.RootInode, "root.txt", []byte("root file"), 0644, 0, 0)
-				b.CreateSymlink(dir, "toroot", "../root.txt", 0, 0)
+				_, err = b.CreateFile(ext4fs.RootInode, "root.txt", []byte("root file"), 0644, 0, 0)
+				require.NoError(t, err)
+				_, err = b.CreateSymlink(dir, "toroot", "../root.txt", 0, 0)
+				require.NoError(t, err)
 			},
 			verify: []string{
 				`readlink "subdir/toroot"`,
@@ -655,11 +606,11 @@ func TestSymlinkCreation(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := newTestContext(t, defaultImageSizeMB)
-			tc.setup(ctx.builder)
-			ctx.finalize()
+			env := newTestEnv(t, defaultImageSizeMB)
+			tc.setup(t, env.builder)
+			env.finalize()
 
-			output := ctx.dockerExecSimple(tc.verify...)
+			output := env.dockerExecSimple(tc.verify...)
 
 			for _, expected := range tc.expects {
 				assert.Contains(t, output, expected)
@@ -668,55 +619,54 @@ func TestSymlinkCreation(t *testing.T) {
 	}
 }
 
-// TestComplexFilesystem tests a realistic filesystem structure
-func TestComplexFilesystem(t *testing.T) {
-	skipIfNoDocker(t)
-
-	ctx := newTestContext(t, defaultImageSizeMB)
+func testComplexFilesystem(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
 	// Create /etc with config files
-	etcDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
+	etcDir, err := env.builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
 	require.NoError(t, err)
-	ctx.builder.CreateFile(etcDir, "passwd", []byte("root:x:0:0:root:/root:/bin/sh\n"), 0644, 0, 0)
-	ctx.builder.CreateFile(etcDir, "hostname", []byte("testhost\n"), 0644, 0, 0)
+	_, err = env.builder.CreateFile(etcDir, "passwd", []byte("root:x:0:0:root:/root:/bin/sh\n"), 0644, 0, 0)
+	require.NoError(t, err)
+	_, err = env.builder.CreateFile(etcDir, "hostname", []byte("testhost\n"), 0644, 0, 0)
+	require.NoError(t, err)
 
 	// Create /home/user
-	homeDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "home", 0755, 0, 0)
+	homeDir, err := env.builder.CreateDirectory(ext4fs.RootInode, "home", 0755, 0, 0)
 	require.NoError(t, err)
-	userDir, err := ctx.builder.CreateDirectory(homeDir, "user", 0750, 1000, 1000)
+	userDir, err := env.builder.CreateDirectory(homeDir, "user", 0750, 1000, 1000)
 	require.NoError(t, err)
-	ctx.builder.CreateFile(userDir, ".bashrc", []byte("export PS1='$ '\n"), 0644, 1000, 1000)
-	ctx.builder.CreateFile(userDir, ".profile", []byte("# profile\n"), 0644, 1000, 1000)
+	_, err = env.builder.CreateFile(userDir, ".bashrc", []byte("export PS1='$ '\n"), 0644, 1000, 1000)
+	require.NoError(t, err)
+	_, err = env.builder.CreateFile(userDir, ".profile", []byte("# profile\n"), 0644, 1000, 1000)
+	require.NoError(t, err)
 
 	// Create /var/log
-	varDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "var", 0755, 0, 0)
+	varDir, err := env.builder.CreateDirectory(ext4fs.RootInode, "var", 0755, 0, 0)
 	require.NoError(t, err)
-	logDir, err := ctx.builder.CreateDirectory(varDir, "log", 0755, 0, 0)
+	logDir, err := env.builder.CreateDirectory(varDir, "log", 0755, 0, 0)
 	require.NoError(t, err)
-	ctx.builder.CreateFile(logDir, "messages", []byte("system started\n"), 0640, 0, 4)
+	_, err = env.builder.CreateFile(logDir, "messages", []byte("system started\n"), 0640, 0, 4)
+	require.NoError(t, err)
 
 	// Create /tmp with sticky bit
-	ctx.builder.CreateDirectory(ext4fs.RootInode, "tmp", 0777|stickyBit, 0, 0)
+	_, err = env.builder.CreateDirectory(ext4fs.RootInode, "tmp", 0777|stickyBit, 0, 0)
+	require.NoError(t, err)
 
 	// Create symlink
-	ctx.builder.CreateSymlink(userDir, "logs", "/var/log", 1000, 1000)
+	_, err = env.builder.CreateSymlink(userDir, "logs", "/var/log", 1000, 1000)
+	require.NoError(t, err)
 
-	ctx.finalize()
+	env.finalize()
 
-	// Comprehensive verification
-	output := ctx.dockerExecSimple(
-		// Check directory structure
+	output := env.dockerExecSimple(
 		`find . -type d | sort`,
 		`echo "---"`,
-		// Check file contents
 		`cat etc/passwd`,
 		`cat etc/hostname`,
 		`echo "---"`,
-		// Check permissions
 		`stat -c "%a %n" tmp`,
 		`stat -c "%u:%g %n" home/user/.bashrc`,
 		`echo "---"`,
-		// Check symlink
 		`readlink home/user/logs`,
 	)
 
@@ -741,68 +691,60 @@ func TestComplexFilesystem(t *testing.T) {
 	assert.Contains(t, output, "/var/log")
 }
 
-// TestLargeFile tests creating a file larger than one block
-func TestLargeFile(t *testing.T) {
-	skipIfNoDocker(t)
+func testLargeFile(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	// Create a file larger than 4KB (one block)
-	// Use 16KB of data (4 blocks)
+	// Create a file larger than 4KB (one block) - use 16KB (4 blocks)
 	largeContent := make([]byte, 16*1024)
 	for i := range largeContent {
 		largeContent[i] = byte(i % 256)
 	}
-	// Add a recognizable header and footer
 	copy(largeContent[:16], []byte("HEADER_START____"))
 	copy(largeContent[len(largeContent)-16:], []byte("____FOOTER_END__"))
 
-	ctx.builder.CreateFile(ext4fs.RootInode, "largefile.bin", largeContent, 0644, 0, 0)
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "largefile.bin", largeContent, 0644, 0, 0)
+	require.NoError(t, err)
+	env.finalize()
 
-	ctx.finalize()
-
-	output := ctx.dockerExecSimple(
+	output := env.dockerExecSimple(
 		`stat -c "%s" largefile.bin`,
 		`head -c 16 largefile.bin`,
 		`tail -c 16 largefile.bin`,
 	)
 
-	assert.Contains(t, output, "16384") // 16KB
+	assert.Contains(t, output, "16384")
 	assert.Contains(t, output, "HEADER_START____")
 	assert.Contains(t, output, "____FOOTER_END__")
 }
 
-// TestFilesystemIntegrity runs e2fsck to verify filesystem integrity
-func TestFilesystemIntegrity(t *testing.T) {
-	skipIfNoDocker(t)
-
+func testFilesystemIntegrity(t *testing.T) {
 	testCases := []struct {
 		name  string
-		setup func(b *ext4fs.Image)
+		setup func(t *testing.T, b *ext4fs.Image)
 	}{
 		{
-			name: "empty filesystem",
-			setup: func(b *ext4fs.Image) {
-				// Just the base filesystem
-			},
+			name:  "empty filesystem",
+			setup: func(t *testing.T, b *ext4fs.Image) {},
 		},
 		{
 			name: "filesystem with files",
-			setup: func(b *ext4fs.Image) {
-				b.CreateFile(ext4fs.RootInode, "test.txt", []byte("test"), 0644, 0, 0)
+			setup: func(t *testing.T, b *ext4fs.Image) {
+				_, err := b.CreateFile(ext4fs.RootInode, "test.txt", []byte("test"), 0644, 0, 0)
+				require.NoError(t, err)
 			},
 		},
 		{
 			name: "filesystem with directories",
-			setup: func(b *ext4fs.Image) {
+			setup: func(t *testing.T, b *ext4fs.Image) {
 				dir, err := b.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
 				require.NoError(t, err)
-				b.CreateFile(dir, "nested.txt", []byte("nested"), 0644, 0, 0)
+				_, err = b.CreateFile(dir, "nested.txt", []byte("nested"), 0644, 0, 0)
+				require.NoError(t, err)
 			},
 		},
 		{
 			name: "complex filesystem",
-			setup: func(b *ext4fs.Image) {
+			setup: func(t *testing.T, b *ext4fs.Image) {
 				for i := 0; i < 5; i++ {
 					dirName := fmt.Sprintf("dir%d", i)
 					dir, err := b.CreateDirectory(ext4fs.RootInode, dirName, 0755, 0, 0)
@@ -811,7 +753,8 @@ func TestFilesystemIntegrity(t *testing.T) {
 					for j := 0; j < 3; j++ {
 						fileName := fmt.Sprintf("file%d.txt", j)
 						content := fmt.Sprintf("Content of %s/%s\n", dirName, fileName)
-						b.CreateFile(dir, fileName, []byte(content), 0644, 0, 0)
+						_, err = b.CreateFile(dir, fileName, []byte(content), 0644, 0, 0)
+						require.NoError(t, err)
 					}
 				}
 			},
@@ -820,45 +763,34 @@ func TestFilesystemIntegrity(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := newTestContext(t, defaultImageSizeMB)
-			tc.setup(ctx.builder)
-			ctx.finalize()
+			env := newTestEnv(t, defaultImageSizeMB)
+			tc.setup(t, env.builder)
+			env.finalize()
 
-			// The dockerExec already runs e2fsck -n -f, which will fail if there are issues
-			// We just need to verify it succeeds
-			_, stderr, err := ctx.dockerExec(`echo "Filesystem check passed"`)
+			// dockerExec already runs e2fsck -n -f which fails on issues
+			_, stderr, err := env.dockerExec(`echo "Filesystem check passed"`)
 			require.NoError(t, err, "e2fsck failed: %s", stderr)
 		})
 	}
 }
 
-// TestDifferentImageSizes tests creating images of various sizes
-func TestDifferentImageSizes(t *testing.T) {
-	skipIfNoDocker(t)
+func testDifferentImageSizes(t *testing.T) {
+	sizes := []int{16, 32, 64, 128}
 
-	testCases := []struct {
-		sizeMB int
-	}{
-		{sizeMB: 16},
-		{sizeMB: 32},
-		{sizeMB: 64},
-		{sizeMB: 128},
-	}
+	for _, sizeMB := range sizes {
+		t.Run(fmt.Sprintf("%dMB", sizeMB), func(t *testing.T) {
+			env := newTestEnv(t, sizeMB)
 
-	for _, tc := range testCases {
-		t.Run(fmt.Sprintf("%dMB", tc.sizeMB), func(t *testing.T) {
-			ctx := newTestContext(t, tc.sizeMB)
-
-			// Add some content
-			ctx.builder.CreateFile(ext4fs.RootInode, "test.txt", []byte("test content"), 0644, 0, 0)
-			dir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+			_, err := env.builder.CreateFile(ext4fs.RootInode, "test.txt", []byte("test content"), 0644, 0, 0)
 			require.NoError(t, err)
-			ctx.builder.CreateFile(dir, "nested.txt", []byte("nested content"), 0644, 0, 0)
+			dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+			require.NoError(t, err)
+			_, err = env.builder.CreateFile(dir, "nested.txt", []byte("nested content"), 0644, 0, 0)
+			require.NoError(t, err)
 
-			ctx.finalize()
+			env.finalize()
 
-			// Verify filesystem works
-			output := ctx.dockerExecSimple(
+			output := env.dockerExecSimple(
 				`cat test.txt`,
 				`cat subdir/nested.txt`,
 			)
@@ -869,31 +801,23 @@ func TestDifferentImageSizes(t *testing.T) {
 	}
 }
 
-// TestFilesystemStatistics verifies that df and other tools work correctly
-func TestFilesystemStatistics(t *testing.T) {
-	skipIfNoDocker(t)
+func testFilesystemStatistics(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "data.bin", make([]byte, 8192), 0644, 0, 0)
+	require.NoError(t, err)
+	env.finalize()
 
-	// Create some files to use space
-	ctx.builder.CreateFile(ext4fs.RootInode, "data.bin", make([]byte, 8192), 0644, 0, 0)
-
-	ctx.finalize()
-
-	output := ctx.dockerExecSimple(
+	output := env.dockerExecSimple(
 		`df -h . | tail -1`,
 		`echo "---"`,
 		`stat -f -c "%T" .`,
 	)
 
-	// Verify filesystem type is ext4 (stat -f shows ext2/ext3/ext4)
 	assert.Contains(t, output, "ext")
 }
 
-// TestSpecialFileNames tests files with edge-case names
-func TestSpecialFileNames(t *testing.T) {
-	skipIfNoDocker(t)
-
+func testSpecialFileNames(t *testing.T) {
 	testCases := []struct {
 		name     string
 		filename string
@@ -911,14 +835,14 @@ func TestSpecialFileNames(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := newTestContext(t, defaultImageSizeMB)
+			env := newTestEnv(t, defaultImageSizeMB)
 
 			content := fmt.Sprintf("Content of %s\n", tc.filename)
-			ctx.builder.CreateFile(ext4fs.RootInode, tc.filename, []byte(content), 0644, 0, 0)
+			_, err := env.builder.CreateFile(ext4fs.RootInode, tc.filename, []byte(content), 0644, 0, 0)
+			require.NoError(t, err)
+			env.finalize()
 
-			ctx.finalize()
-
-			output := ctx.dockerExecSimple(
+			output := env.dockerExecSimple(
 				fmt.Sprintf(`cat "%s"`, tc.filename),
 			)
 
@@ -927,33 +851,25 @@ func TestSpecialFileNames(t *testing.T) {
 	}
 }
 
-// TestMultiBlockDirectory tests that directories can span multiple blocks
-// This is important for directories with many entries
-func TestMultiBlockDirectory(t *testing.T) {
-	skipIfNoDocker(t)
+func testMultiBlockDirectory(t *testing.T) {
+	env := newTestEnv(t, 128)
 
-	tc := newTestContext(t, 128) // Use larger image for this test
-
-	// Create a directory that will need multiple blocks
-	// Each directory entry takes roughly 12-24 bytes (depends on name length)
-	// A 4KB block can hold approximately 170-340 entries
-	// We'll create 400 files to ensure we need at least 2 blocks
-	testDir, err := tc.builder.CreateDirectory(ext4fs.RootInode, "many_files", 0755, 0, 0)
+	testDir, err := env.builder.CreateDirectory(ext4fs.RootInode, "many_files", 0755, 0, 0)
 	require.NoError(t, err)
 
 	numFiles := 400
 	for i := 0; i < numFiles; i++ {
 		fileName := fmt.Sprintf("file_%03d.txt", i)
 		content := fmt.Sprintf("This is file number %d\n", i)
-		tc.builder.CreateFile(testDir, fileName, []byte(content), 0644, 0, 0)
+		_, err = env.builder.CreateFile(testDir, fileName, []byte(content), 0644, 0, 0)
+		require.NoError(t, err)
 	}
 
-	tc.finalize()
+	env.finalize()
 
-	// Verify the directory exists and has all files
-	output := tc.dockerExecSimple(
+	output := env.dockerExecSimple(
 		`cd many_files`,
-		`ls -1 | wc -l`, // Count files
+		`ls -1 | wc -l`,
 		`test -f file_000.txt && echo "first file exists"`,
 		`test -f file_199.txt && echo "middle file exists"`,
 		`test -f file_399.txt && echo "last file exists"`,
@@ -961,7 +877,7 @@ func TestMultiBlockDirectory(t *testing.T) {
 		`cat file_399.txt`,
 	)
 
-	assert.Contains(t, output, "400") // Should have 400 files
+	assert.Contains(t, output, "400")
 	assert.Contains(t, output, "first file exists")
 	assert.Contains(t, output, "middle file exists")
 	assert.Contains(t, output, "last file exists")
@@ -969,41 +885,39 @@ func TestMultiBlockDirectory(t *testing.T) {
 	assert.Contains(t, output, "This is file number 399")
 }
 
-// TestMultiBlockDirectoryWithSymlinks tests multi-block directories with various entry types
-func TestMultiBlockDirectoryWithSymlinks(t *testing.T) {
-	skipIfNoDocker(t)
+func testMultiBlockDirectoryWithSymlinks(t *testing.T) {
+	env := newTestEnv(t, 128)
 
-	tc := newTestContext(t, 128)
-
-	// Create a directory with mixed content types
-	testDir, err := tc.builder.CreateDirectory(ext4fs.RootInode, "mixed_dir", 0755, 0, 0)
+	testDir, err := env.builder.CreateDirectory(ext4fs.RootInode, "mixed_dir", 0755, 0, 0)
 	require.NoError(t, err)
 
 	// Add 100 regular files
 	for i := 0; i < 100; i++ {
 		fileName := fmt.Sprintf("regular_%03d.txt", i)
-		tc.builder.CreateFile(testDir, fileName, []byte("regular file"), 0644, 0, 0)
+		_, err = env.builder.CreateFile(testDir, fileName, []byte("regular file"), 0644, 0, 0)
+		require.NoError(t, err)
 	}
 
 	// Add 100 subdirectories
 	for i := 0; i < 100; i++ {
 		dirName := fmt.Sprintf("subdir_%03d", i)
-		tc.builder.CreateDirectory(testDir, dirName, 0755, 0, 0)
+		_, err = env.builder.CreateDirectory(testDir, dirName, 0755, 0, 0)
+		require.NoError(t, err)
 	}
 
 	// Add 100 symlinks
 	for i := 0; i < 100; i++ {
 		linkName := fmt.Sprintf("link_%03d", i)
 		target := fmt.Sprintf("regular_%03d.txt", i)
-		tc.builder.CreateSymlink(testDir, linkName, target, 0, 0)
+		_, err = env.builder.CreateSymlink(testDir, linkName, target, 0, 0)
+		require.NoError(t, err)
 	}
 
-	tc.finalize()
+	env.finalize()
 
-	// Verify all entries exist
-	output := tc.dockerExecSimple(
+	output := env.dockerExecSimple(
 		`cd mixed_dir`,
-		`ls -1 | wc -l`, // Count total entries
+		`ls -1 | wc -l`,
 		`ls -1 regular_* | wc -l`,
 		`ls -1d subdir_* | wc -l`,
 		`ls -1 link_* | wc -l`,
@@ -1013,43 +927,38 @@ func TestMultiBlockDirectoryWithSymlinks(t *testing.T) {
 		`readlink link_050`,
 	)
 
-	assert.Contains(t, output, "300") // Total entries
-	assert.Contains(t, output, "100") // Regular files, subdirs, and symlinks each
+	assert.Contains(t, output, "300")
+	assert.Contains(t, output, "100")
 	assert.Contains(t, output, "regular file exists")
 	assert.Contains(t, output, "subdir exists")
 	assert.Contains(t, output, "symlink exists")
-	assert.Contains(t, output, "regular_050.txt") // Symlink target
+	assert.Contains(t, output, "regular_050.txt")
 }
 
-// TestMultiBlockDirectoryNested tests nested directories with many entries
-func TestMultiBlockDirectoryNested(t *testing.T) {
-	skipIfNoDocker(t)
+func testMultiBlockDirectoryNested(t *testing.T) {
+	env := newTestEnv(t, 128)
 
-	tc := newTestContext(t, 128)
-
-	// Create nested structure with many files at each level
-	level1, err := tc.builder.CreateDirectory(ext4fs.RootInode, "level1", 0755, 0, 0)
+	level1, err := env.builder.CreateDirectory(ext4fs.RootInode, "level1", 0755, 0, 0)
 	require.NoError(t, err)
 
-	// Add many files to level1
 	for i := 0; i < 200; i++ {
 		fileName := fmt.Sprintf("l1_file_%03d.txt", i)
-		tc.builder.CreateFile(level1, fileName, []byte("level 1 content"), 0644, 0, 0)
+		_, err = env.builder.CreateFile(level1, fileName, []byte("level 1 content"), 0644, 0, 0)
+		require.NoError(t, err)
 	}
 
-	level2, err := tc.builder.CreateDirectory(level1, "level2", 0755, 0, 0)
+	level2, err := env.builder.CreateDirectory(level1, "level2", 0755, 0, 0)
 	require.NoError(t, err)
 
-	// Add many files to level2
 	for i := 0; i < 200; i++ {
 		fileName := fmt.Sprintf("l2_file_%03d.txt", i)
-		tc.builder.CreateFile(level2, fileName, []byte("level 2 content"), 0644, 0, 0)
+		_, err = env.builder.CreateFile(level2, fileName, []byte("level 2 content"), 0644, 0, 0)
+		require.NoError(t, err)
 	}
 
-	tc.finalize()
+	env.finalize()
 
-	// Verify nested structure
-	output := tc.dockerExecSimple(
+	output := env.dockerExecSimple(
 		`cd level1`,
 		`ls -1 l1_file_* | wc -l`,
 		`test -d level2 && echo "level2 exists"`,
@@ -1063,68 +972,22 @@ func TestMultiBlockDirectoryNested(t *testing.T) {
 	assert.Contains(t, output, "level 2 content")
 }
 
-// BenchmarkFilesystemCreation benchmarks the image creation process
-func BenchmarkFilesystemCreation(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		tmpDir := b.TempDir()
-		imagePath := filepath.Join(tmpDir, "bench.img")
+func testExtentTreeConversion(t *testing.T) {
+	env := newTestEnv(t, 128)
 
-		builder, err := ext4fs.New(ext4fs.WithImagePath(imagePath), ext4fs.WithSizeInMB(64))
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		// Create some content
-		for j := 0; j < 10; j++ {
-			dirName := fmt.Sprintf("dir%d", j)
-			dir, err := builder.CreateDirectory(ext4fs.RootInode, dirName, 0755, 0, 0)
-			require.NoError(b, err)
-
-			for k := 0; k < 5; k++ {
-				fileName := fmt.Sprintf("file%d.txt", k)
-				content := fmt.Sprintf("Content %d-%d", j, k)
-				builder.CreateFile(dir, fileName, []byte(content), 0644, 0, 0)
-			}
-		}
-
-		// Save() already finalizes metadata internally
-		if err := builder.Save(); err != nil {
-			b.Fatal(err)
-		}
-
-		if err := builder.Close(); err != nil {
-			b.Fatal(err)
-		}
-
-		os.Remove(imagePath)
-	}
-}
-
-// TestExtentTreeConversion tests the conversion from flat to indexed extent trees
-func TestExtentTreeConversion(t *testing.T) {
-	skipIfNoDocker(t)
-
-	tc := newTestContext(t, 128)
-
-	// Create a directory and add files until we trigger extent tree conversion
-	// Each file creates a directory entry, and when entries fill the first block,
-	// a new block is allocated. When we have >4 non-contiguous extent ranges,
-	// the extent tree must convert from flat to indexed.
-
-	testDir, err := tc.builder.CreateDirectory(ext4fs.RootInode, "extent_test", 0755, 0, 0)
+	testDir, err := env.builder.CreateDirectory(ext4fs.RootInode, "extent_test", 0755, 0, 0)
 	require.NoError(t, err)
 
-	// Create many files to force multiple blocks and potential non-contiguous allocation
 	for i := 0; i < 500; i++ {
 		fileName := fmt.Sprintf("file_%04d.txt", i)
 		content := fmt.Sprintf("Content %d\n", i)
-		tc.builder.CreateFile(testDir, fileName, []byte(content), 0644, 0, 0)
+		_, err = env.builder.CreateFile(testDir, fileName, []byte(content), 0644, 0, 0)
+		require.NoError(t, err)
 	}
 
-	tc.finalize()
+	env.finalize()
 
-	// Verify all files exist and are readable
-	output := tc.dockerExecSimple(
+	output := env.dockerExecSimple(
 		`cd extent_test`,
 		`ls -1 | wc -l`,
 		`test -f file_0000.txt && echo "first exists"`,
@@ -1142,10 +1005,7 @@ func TestExtentTreeConversion(t *testing.T) {
 	assert.Contains(t, output, "Content 499")
 }
 
-// TestXattrBasic tests basic extended attribute operations
-func TestXattrBasic(t *testing.T) {
-	skipIfNoDocker(t)
-
+func testXattrBasic(t *testing.T) {
 	testCases := []struct {
 		name      string
 		xattrName string
@@ -1159,7 +1019,7 @@ func TestXattrBasic(t *testing.T) {
 		{
 			name:      "security selinux context",
 			xattrName: "security.selinux",
-			value:     "unconfined_u:object_r:user_home_t:s0\x00", // SELinux contexts have null terminator
+			value:     "unconfined_u:object_r:user_home_t:s0\x00",
 		},
 		{
 			name:      "trusted xattr",
@@ -1180,55 +1040,44 @@ func TestXattrBasic(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := newTestContext(t, defaultImageSizeMB)
+			env := newTestEnv(t, defaultImageSizeMB)
 
-			// Create a file and set xattr
-			fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "testfile.txt", []byte("content"), 0644, 0, 0)
+			fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "testfile.txt", []byte("content"), 0644, 0, 0)
 			require.NoError(t, err)
 
-			err = ctx.builder.SetXattr(fileInode, tc.xattrName, []byte(tc.value))
+			err = env.builder.SetXattr(fileInode, tc.xattrName, []byte(tc.value))
 			require.NoError(t, err)
 
-			ctx.finalize()
+			env.finalize()
 
-			// Verify xattr exists and has correct value
-			// Note: getfattr needs -m pattern to show non-user xattrs
 			var commands []string
 			if strings.HasPrefix(tc.xattrName, "user.") {
 				commands = []string{
-					`apk add --no-cache attr > /dev/null 2>&1`,
 					fmt.Sprintf(`getfattr -n "%s" --only-values testfile.txt | xxd`, tc.xattrName),
 				}
 			} else if strings.HasPrefix(tc.xattrName, "security.") {
 				commands = []string{
-					`apk add --no-cache attr > /dev/null 2>&1`,
 					fmt.Sprintf(`getfattr -n "%s" --only-values testfile.txt 2>/dev/null | xxd || echo "xattr set but not readable without privileges"`, tc.xattrName),
 					fmt.Sprintf(`getfattr -d -m - testfile.txt 2>/dev/null | grep -q "%s" && echo "xattr exists in listing"`, tc.xattrName),
 				}
 			} else {
 				commands = []string{
-					`apk add --no-cache attr > /dev/null 2>&1`,
 					fmt.Sprintf(`getfattr -n "%s" --only-values testfile.txt 2>/dev/null | xxd || echo "xattr requires privileges"`, tc.xattrName),
 				}
 			}
 
-			output := ctx.dockerExecSimple(commands...)
-			// For user xattrs, verify the value
+			output := env.dockerExecSimple(commands...)
+
 			if strings.HasPrefix(tc.xattrName, "user.") {
-				// xxd output will contain hex representation
 				assert.NotEmpty(t, output)
 			}
 		})
 	}
 }
 
-// TestXattrSELinux tests SELinux context xattrs specifically
-func TestXattrSELinux(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrSELinux(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	// Create files with different SELinux contexts
 	contexts := []struct {
 		filename string
 		context  string
@@ -1239,36 +1088,28 @@ func TestXattrSELinux(t *testing.T) {
 	}
 
 	for _, c := range contexts {
-		fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, c.filename, []byte("content"), 0644, 0, 0)
+		fileInode, err := env.builder.CreateFile(ext4fs.RootInode, c.filename, []byte("content"), 0644, 0, 0)
 		require.NoError(t, err)
-		// SELinux contexts must have null terminator
-		err = ctx.builder.SetXattr(fileInode, "security.selinux", []byte(c.context+"\x00"))
+		err = env.builder.SetXattr(fileInode, "security.selinux", []byte(c.context+"\x00"))
 		require.NoError(t, err)
 	}
 
-	ctx.finalize()
+	env.finalize()
 
-	// Verify xattrs are present
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
+	output := env.dockerExecSimple(
 		`getfattr -d -m security.selinux system_file.txt 2>/dev/null || true`,
 		`getfattr -d -m - user_file.txt 2>/dev/null | grep -c security || echo "0"`,
 	)
 
-	// We just verify the command succeeds and xattrs exist
 	assert.NotEmpty(t, output)
 }
 
-// TestXattrMultiple tests multiple xattrs on a single file
-func TestXattrMultiple(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrMultiple(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "multi_xattr.txt", []byte("content"), 0644, 0, 0)
+	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "multi_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	// Set multiple xattrs
 	xattrs := map[string]string{
 		"user.attr1":          "value1",
 		"user.attr2":          "value2",
@@ -1277,49 +1118,40 @@ func TestXattrMultiple(t *testing.T) {
 	}
 
 	for name, value := range xattrs {
-		err := ctx.builder.SetXattr(fileInode, name, []byte(value))
+		err := env.builder.SetXattr(fileInode, name, []byte(value))
 		require.NoError(t, err)
 	}
 
-	ctx.finalize()
+	env.finalize()
 
-	// Verify all xattrs are present
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
-		`getfattr -d multi_xattr.txt`,
-	)
+	output := env.dockerExecSimple(`getfattr -d multi_xattr.txt`)
 
 	for name := range xattrs {
 		assert.Contains(t, output, name)
 	}
 }
 
-// TestXattrOnDirectory tests xattrs on directories
-func TestXattrOnDirectory(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrOnDirectory(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	dirInode, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "labeled_dir", 0755, 0, 0)
+	dirInode, err := env.builder.CreateDirectory(ext4fs.RootInode, "labeled_dir", 0755, 0, 0)
 	require.NoError(t, err)
 
-	err = ctx.builder.SetXattr(dirInode, "user.dir_attr", []byte("directory_value"))
+	err = env.builder.SetXattr(dirInode, "user.dir_attr", []byte("directory_value"))
 	require.NoError(t, err)
 
-	err = ctx.builder.SetXattr(dirInode, "security.selinux", []byte("system_u:object_r:var_t:s0\x00"))
+	err = env.builder.SetXattr(dirInode, "security.selinux", []byte("system_u:object_r:var_t:s0\x00"))
 	require.NoError(t, err)
 
-	// Create a file in the directory
-	fileInode, err := ctx.builder.CreateFile(dirInode, "file_in_dir.txt", []byte("content"), 0644, 0, 0)
+	fileInode, err := env.builder.CreateFile(dirInode, "file_in_dir.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	err = ctx.builder.SetXattr(fileInode, "user.file_attr", []byte("file_value"))
+	err = env.builder.SetXattr(fileInode, "user.file_attr", []byte("file_value"))
 	require.NoError(t, err)
 
-	ctx.finalize()
+	env.finalize()
 
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
+	output := env.dockerExecSimple(
 		`getfattr -d labeled_dir`,
 		`getfattr -d labeled_dir/file_in_dir.txt`,
 	)
@@ -1328,89 +1160,65 @@ func TestXattrOnDirectory(t *testing.T) {
 	assert.Contains(t, output, "user.file_attr")
 }
 
-// TestXattrOverwrite tests overwriting xattr values
-func TestXattrOverwrite(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrOverwrite(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "overwrite.txt", []byte("content"), 0644, 0, 0)
+	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "overwrite.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	// Set initial value
-	err = ctx.builder.SetXattr(fileInode, "user.test", []byte("initial_value"))
+	err = env.builder.SetXattr(fileInode, "user.test", []byte("initial_value"))
 	require.NoError(t, err)
 
-	// Overwrite with new value
-	err = ctx.builder.SetXattr(fileInode, "user.test", []byte("new_value"))
+	err = env.builder.SetXattr(fileInode, "user.test", []byte("new_value"))
 	require.NoError(t, err)
 
-	ctx.finalize()
+	env.finalize()
 
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
-		`getfattr -n user.test --only-values overwrite.txt`,
-	)
+	output := env.dockerExecSimple(`getfattr -n user.test --only-values overwrite.txt`)
 
 	assert.Contains(t, output, "new_value")
 	assert.NotContains(t, output, "initial_value")
 }
 
-// TestXattrLargeValue tests xattrs with larger values
-func TestXattrLargeValue(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrLargeValue(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "large_xattr.txt", []byte("content"), 0644, 0, 0)
+	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "large_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	// Create a large xattr value (but must fit in one block minus overhead)
-	// Max is roughly 4096 - 32 (header) - 16 (entry) - name_len
 	largeValue := make([]byte, 2000)
 	for i := range largeValue {
 		largeValue[i] = byte('A' + (i % 26))
 	}
 
-	err = ctx.builder.SetXattr(fileInode, "user.large", largeValue)
+	err = env.builder.SetXattr(fileInode, "user.large", largeValue)
 	require.NoError(t, err)
 
-	ctx.finalize()
+	env.finalize()
 
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
-		`getfattr -n user.large --only-values large_xattr.txt | wc -c`,
-	)
+	output := env.dockerExecSimple(`getfattr -n user.large --only-values large_xattr.txt | wc -c`)
 
-	// Should have 2000 bytes (plus possible newline)
 	assert.Contains(t, output, "2000")
 }
 
-// TestXattrWithFileOverwrite tests that xattrs are preserved or reset on file overwrite
-func TestXattrWithFileOverwrite(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrWithFileOverwrite(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	// Create file with xattr
-	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "xattr_overwrite.txt", []byte("original"), 0644, 0, 0)
+	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "xattr_overwrite.txt", []byte("original"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	err = ctx.builder.SetXattr(fileInode, "user.original", []byte("original_attr"))
+	err = env.builder.SetXattr(fileInode, "user.original", []byte("original_attr"))
 	require.NoError(t, err)
 
-	// Overwrite the file
-	newInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "xattr_overwrite.txt", []byte("new content"), 0644, 0, 0)
+	newInode, err := env.builder.CreateFile(ext4fs.RootInode, "xattr_overwrite.txt", []byte("new content"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	// Set new xattr on overwritten file
-	err = ctx.builder.SetXattr(newInode, "user.new", []byte("new_attr"))
+	err = env.builder.SetXattr(newInode, "user.new", []byte("new_attr"))
 	require.NoError(t, err)
 
-	ctx.finalize()
+	env.finalize()
 
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
+	output := env.dockerExecSimple(
 		`cat xattr_overwrite.txt`,
 		`echo "---"`,
 		`getfattr -d xattr_overwrite.txt`,
@@ -1420,27 +1228,21 @@ func TestXattrWithFileOverwrite(t *testing.T) {
 	assert.Contains(t, output, "user.new")
 }
 
-// TestXattrSymlink tests xattrs on symlinks
-func TestXattrSymlink(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrSymlink(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	// Create target file
-	ctx.builder.CreateFile(ext4fs.RootInode, "target.txt", []byte("target content"), 0644, 0, 0)
-
-	// Create symlink
-	linkInode, err := ctx.builder.CreateSymlink(ext4fs.RootInode, "link.txt", "target.txt", 0, 0)
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "target.txt", []byte("target content"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	// Set xattr on symlink itself
-	err = ctx.builder.SetXattr(linkInode, "user.link_attr", []byte("link_value"))
+	linkInode, err := env.builder.CreateSymlink(ext4fs.RootInode, "link.txt", "target.txt", 0, 0)
 	require.NoError(t, err)
 
-	ctx.finalize()
+	err = env.builder.SetXattr(linkInode, "user.link_attr", []byte("link_value"))
+	require.NoError(t, err)
 
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
+	env.finalize()
+
+	output := env.dockerExecSimple(
 		`getfattr -h -d link.txt 2>/dev/null || echo "symlink xattr not readable"`,
 		`test -L link.txt && echo "is symlink"`,
 	)
@@ -1448,20 +1250,13 @@ func TestXattrSymlink(t *testing.T) {
 	assert.Contains(t, output, "is symlink")
 }
 
-// TestXattrCapabilities tests file capabilities via xattrs
-func TestXattrCapabilities(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrCapabilities(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	// Create an executable
-	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "ping_clone", []byte("#!/bin/sh\necho ping"), 0755, 0, 0)
+	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "ping_clone", []byte("#!/bin/sh\necho ping"), 0755, 0, 0)
 	require.NoError(t, err)
 
-	// Set capability xattr (CAP_NET_RAW example - simplified binary format)
-	// This is a VFS capability v2 structure for CAP_NET_RAW (bit 13)
-	// Format: magic (4) + permitted (4) + inheritable (4) + rootid (4) for v3
-	// For v2: magic (4) + permitted_lo (4) + permitted_hi (4) + inheritable_lo (4) + inheritable_hi (4)
+	// VFS capability v2 structure for CAP_NET_RAW (bit 13)
 	capData := []byte{
 		0x00, 0x00, 0x00, 0x02, // VFS_CAP_REVISION_2
 		0x00, 0x20, 0x00, 0x00, // permitted low (CAP_NET_RAW = bit 13)
@@ -1470,70 +1265,56 @@ func TestXattrCapabilities(t *testing.T) {
 		0x00, 0x00, 0x00, 0x00, // inheritable high
 	}
 
-	err = ctx.builder.SetXattr(fileInode, "security.capability", capData)
+	err = env.builder.SetXattr(fileInode, "security.capability", capData)
 	require.NoError(t, err)
 
-	ctx.finalize()
+	env.finalize()
 
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr libcap > /dev/null 2>&1`,
+	output := env.dockerExecSimple(
 		`getfattr -d -m security.capability ping_clone 2>/dev/null | grep -c capability || echo "0"`,
 		`getcap ping_clone 2>/dev/null || echo "getcap requires privileges"`,
 	)
 
-	// Just verify the xattr exists
 	assert.NotEmpty(t, output)
 }
 
-// TestXattrRemove tests removing xattrs (internal API test)
-func TestXattrRemove(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrRemove(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "remove_xattr.txt", []byte("content"), 0644, 0, 0)
+	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "remove_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	// Set multiple xattrs
-	err = ctx.builder.SetXattr(fileInode, "user.keep", []byte("keep_value"))
+	err = env.builder.SetXattr(fileInode, "user.keep", []byte("keep_value"))
 	require.NoError(t, err)
 
-	err = ctx.builder.SetXattr(fileInode, "user.remove", []byte("remove_value"))
+	err = env.builder.SetXattr(fileInode, "user.remove", []byte("remove_value"))
 	require.NoError(t, err)
 
-	// Remove one xattr
-	err = ctx.builder.RemoveXattr(fileInode, "user.remove")
+	err = env.builder.RemoveXattr(fileInode, "user.remove")
 	require.NoError(t, err)
 
-	ctx.finalize()
+	env.finalize()
 
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
-		`getfattr -d remove_xattr.txt`,
-	)
+	output := env.dockerExecSimple(`getfattr -d remove_xattr.txt`)
 
 	assert.Contains(t, output, "user.keep")
 	assert.NotContains(t, output, "user.remove")
 }
 
-// TestXattrList tests listing xattrs (internal API test)
-func TestXattrList(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrList(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "list_xattr.txt", []byte("content"), 0644, 0, 0)
+	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "list_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
 
 	expectedAttrs := []string{"user.alpha", "user.beta", "user.gamma"}
 
 	for _, attr := range expectedAttrs {
-		err = ctx.builder.SetXattr(fileInode, attr, []byte("value"))
+		err = env.builder.SetXattr(fileInode, attr, []byte("value"))
 		require.NoError(t, err)
 	}
 
-	// Test internal list function
-	listedAttrs, err := ctx.builder.ListXattrs(fileInode)
+	listedAttrs, err := env.builder.ListXattrs(fileInode)
 	require.NoError(t, err)
 	assert.Len(t, listedAttrs, len(expectedAttrs))
 
@@ -1541,61 +1322,61 @@ func TestXattrList(t *testing.T) {
 		assert.Contains(t, listedAttrs, expected)
 	}
 
-	ctx.finalize()
+	env.finalize()
 
-	// Verify with actual filesystem
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
-		`getfattr -d list_xattr.txt | grep -c "user\." || echo "0"`,
-	)
+	output := env.dockerExecSimple(`getfattr -d list_xattr.txt | grep -c "user\\." || echo "0"`)
 
 	assert.Contains(t, output, "3")
 }
 
-// TestXattrComplexFilesystem tests xattrs in a complex filesystem structure
-func TestXattrComplexFilesystem(t *testing.T) {
-	skipIfNoDocker(t)
-
-	ctx := newTestContext(t, defaultImageSizeMB)
+func testXattrComplexFilesystem(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
 	// Create /etc with SELinux contexts
-	etcDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
+	etcDir, err := env.builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
 	require.NoError(t, err)
-	ctx.builder.SetXattr(etcDir, "security.selinux", []byte("system_u:object_r:etc_t:s0\x00"))
+	err = env.builder.SetXattr(etcDir, "security.selinux", []byte("system_u:object_r:etc_t:s0\x00"))
+	require.NoError(t, err)
 
-	passwdInode, err := ctx.builder.CreateFile(etcDir, "passwd", []byte("root:x:0:0::/root:/bin/bash\n"), 0644, 0, 0)
+	passwdInode, err := env.builder.CreateFile(etcDir, "passwd", []byte("root:x:0:0::/root:/bin/bash\n"), 0644, 0, 0)
 	require.NoError(t, err)
-	ctx.builder.SetXattr(passwdInode, "security.selinux", []byte("system_u:object_r:passwd_file_t:s0\x00"))
+	err = env.builder.SetXattr(passwdInode, "security.selinux", []byte("system_u:object_r:passwd_file_t:s0\x00"))
+	require.NoError(t, err)
 
-	shadowInode, err := ctx.builder.CreateFile(etcDir, "shadow", []byte("root:!:::::::\n"), 0000, 0, 0)
+	shadowInode, err := env.builder.CreateFile(etcDir, "shadow", []byte("root:!:::::::\n"), 0000, 0, 0)
 	require.NoError(t, err)
-	ctx.builder.SetXattr(shadowInode, "security.selinux", []byte("system_u:object_r:shadow_t:s0\x00"))
+	err = env.builder.SetXattr(shadowInode, "security.selinux", []byte("system_u:object_r:shadow_t:s0\x00"))
+	require.NoError(t, err)
 
 	// Create /bin with executable capabilities
-	binDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "bin", 0755, 0, 0)
+	binDir, err := env.builder.CreateDirectory(ext4fs.RootInode, "bin", 0755, 0, 0)
 	require.NoError(t, err)
-	ctx.builder.SetXattr(binDir, "security.selinux", []byte("system_u:object_r:bin_t:s0\x00"))
+	err = env.builder.SetXattr(binDir, "security.selinux", []byte("system_u:object_r:bin_t:s0\x00"))
+	require.NoError(t, err)
 
 	// Create /home/user with user xattrs
-	homeDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "home", 0755, 0, 0)
+	homeDir, err := env.builder.CreateDirectory(ext4fs.RootInode, "home", 0755, 0, 0)
 	require.NoError(t, err)
 
-	userDir, err := ctx.builder.CreateDirectory(homeDir, "user", 0700, 1000, 1000)
+	userDir, err := env.builder.CreateDirectory(homeDir, "user", 0700, 1000, 1000)
 	require.NoError(t, err)
-	ctx.builder.SetXattr(userDir, "security.selinux", []byte("unconfined_u:object_r:user_home_dir_t:s0\x00"))
-	ctx.builder.SetXattr(userDir, "user.quota.space", []byte("1073741824")) // 1GB quota
-
-	docInode, err := ctx.builder.CreateFile(userDir, "document.txt", []byte("My document\n"), 0644, 1000, 1000)
+	err = env.builder.SetXattr(userDir, "security.selinux", []byte("unconfined_u:object_r:user_home_dir_t:s0\x00"))
 	require.NoError(t, err)
-	ctx.builder.SetXattr(docInode, "security.selinux", []byte("unconfined_u:object_r:user_home_t:s0\x00"))
-	ctx.builder.SetXattr(docInode, "user.author", []byte("testuser"))
-	ctx.builder.SetXattr(docInode, "user.created", []byte("2024-01-01"))
+	err = env.builder.SetXattr(userDir, "user.quota.space", []byte("1073741824"))
+	require.NoError(t, err)
 
-	ctx.finalize()
+	docInode, err := env.builder.CreateFile(userDir, "document.txt", []byte("My document\n"), 0644, 1000, 1000)
+	require.NoError(t, err)
+	err = env.builder.SetXattr(docInode, "security.selinux", []byte("unconfined_u:object_r:user_home_t:s0\x00"))
+	require.NoError(t, err)
+	err = env.builder.SetXattr(docInode, "user.author", []byte("testuser"))
+	require.NoError(t, err)
+	err = env.builder.SetXattr(docInode, "user.created", []byte("2024-01-01"))
+	require.NoError(t, err)
 
-	// Verify the structure
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
+	env.finalize()
+
+	output := env.dockerExecSimple(
 		`getfattr -d -m - etc 2>/dev/null | head -5`,
 		`getfattr -d home/user/document.txt`,
 		`cat home/user/document.txt`,
@@ -1606,30 +1387,25 @@ func TestXattrComplexFilesystem(t *testing.T) {
 	assert.Contains(t, output, "user.created")
 }
 
-// TestXattrManyFiles tests xattrs on many files
-func TestXattrManyFiles(t *testing.T) {
-	skipIfNoDocker(t)
-
-	ctx := newTestContext(t, 128) // Larger image
+func testXattrManyFiles(t *testing.T) {
+	env := newTestEnv(t, 128)
 
 	numFiles := 100
-
 	for i := 0; i < numFiles; i++ {
 		filename := fmt.Sprintf("file_%03d.txt", i)
-		fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, filename, []byte(fmt.Sprintf("content %d", i)), 0644, 0, 0)
+		fileInode, err := env.builder.CreateFile(ext4fs.RootInode, filename, []byte(fmt.Sprintf("content %d", i)), 0644, 0, 0)
 		require.NoError(t, err)
 
-		err = ctx.builder.SetXattr(fileInode, "user.index", []byte(fmt.Sprintf("%d", i)))
+		err = env.builder.SetXattr(fileInode, "user.index", []byte(fmt.Sprintf("%d", i)))
 		require.NoError(t, err)
 
-		err = ctx.builder.SetXattr(fileInode, "security.selinux", []byte(fmt.Sprintf("user_u:object_r:file_%d_t:s0\x00", i)))
+		err = env.builder.SetXattr(fileInode, "security.selinux", []byte(fmt.Sprintf("user_u:object_r:file_%d_t:s0\x00", i)))
 		require.NoError(t, err)
 	}
 
-	ctx.finalize()
+	env.finalize()
 
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
+	output := env.dockerExecSimple(
 		`ls -1 file_*.txt | wc -l`,
 		`getfattr -n user.index --only-values file_000.txt`,
 		`getfattr -n user.index --only-values file_099.txt`,
@@ -1640,45 +1416,33 @@ func TestXattrManyFiles(t *testing.T) {
 	assert.Contains(t, output, "99")
 }
 
-// TestXattrEmpty tests empty xattr values
-func TestXattrEmpty(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrEmpty(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "empty_xattr.txt", []byte("content"), 0644, 0, 0)
+	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "empty_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	// Set xattr with empty value
-	err = ctx.builder.SetXattr(fileInode, "user.empty", []byte{})
+	err = env.builder.SetXattr(fileInode, "user.empty", []byte{})
 	require.NoError(t, err)
 
-	// Set xattr with actual value for comparison
-	err = ctx.builder.SetXattr(fileInode, "user.notempty", []byte("has_value"))
+	err = env.builder.SetXattr(fileInode, "user.notempty", []byte("has_value"))
 	require.NoError(t, err)
 
-	ctx.finalize()
+	env.finalize()
 
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr > /dev/null 2>&1`,
-		`getfattr -d empty_xattr.txt`,
-	)
+	output := env.dockerExecSimple(`getfattr -d empty_xattr.txt`)
 
 	assert.Contains(t, output, "user.empty")
 	assert.Contains(t, output, "user.notempty")
 }
 
-// TestXattrPosixACL tests POSIX ACL xattrs
-func TestXattrPosixACL(t *testing.T) {
-	skipIfNoDocker(t)
+func testXattrPosixACL(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
 
-	ctx := newTestContext(t, defaultImageSizeMB)
-
-	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "acl_file.txt", []byte("content"), 0644, 0, 0)
+	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "acl_file.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	// POSIX ACL format (simplified - version 2)
-	// This represents: user::rw-, group::r--, other::r--
+	// POSIX ACL format (version 2): user::rw-, group::r--, other::r--
 	aclData := []byte{
 		0x02, 0x00, 0x00, 0x00, // version 2
 		0x01, 0x00, // ACL_USER_OBJ
@@ -1689,20 +1453,22 @@ func TestXattrPosixACL(t *testing.T) {
 		0x04, 0x00, // permissions: r--
 	}
 
-	err = ctx.builder.SetXattr(fileInode, "system.posix_acl_access", aclData)
+	err = env.builder.SetXattr(fileInode, "system.posix_acl_access", aclData)
 	require.NoError(t, err)
 
-	ctx.finalize()
+	env.finalize()
 
-	output := ctx.dockerExecSimple(
-		`apk add --no-cache attr acl > /dev/null 2>&1`,
+	output := env.dockerExecSimple(
 		`getfattr -d -m - acl_file.txt 2>/dev/null | grep -c posix_acl || echo "0"`,
 		`getfacl acl_file.txt 2>/dev/null || echo "acl present"`,
 	)
 
-	// Just verify it doesn't crash and xattr exists
 	assert.NotEmpty(t, output)
 }
+
+// =============================================================================
+// Fingerprint Test
+// =============================================================================
 
 // TestFullFeaturesFixtureFingerprint verifies that building the full-features
 // filesystem with a fixed createdAt timestamp produces a deterministic image
@@ -1714,14 +1480,194 @@ func TestFullFeaturesFixtureFingerprint(t *testing.T) {
 	size, fileHash, err := buildAndHashFullFeaturesFixture(imagePath)
 	require.NoError(t, err)
 
-	actual := fixtureFingerprint(size, fileHash)
+	actual := computeFingerprint(size, fileHash)
 	assert.Equal(t, expectedSHA256Hex, actual, "fingerprint mismatch: expected=%s actual=%s", expectedSHA256Hex, actual)
 }
 
-// buildAndHashFullFeaturesFixture builds the same fixture image as the
-// cmd/ext4-fixtures helper, then returns its size and sha256 hash.
-func buildAndHashFullFeaturesFixture(imagePath string) (uint64, string, error) {
-	// Ensure no stale file
+// =============================================================================
+// Test Infrastructure
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Test Environment
+// -----------------------------------------------------------------------------
+
+// testEnv encapsulates all resources needed for a single end-to-end test case.
+// It manages the temporary image file and ext4fs.Image instance, providing
+// convenience methods for finalizing and executing Docker commands.
+type testEnv struct {
+	t         *testing.T
+	imagePath string
+	builder   *ext4fs.Image
+}
+
+// newTestEnv creates a new test environment with the specified image size.
+// The image file is created in the shared host directory (bind-mounted to Docker)
+// so it's immediately accessible inside the container without docker cp.
+func newTestEnv(t *testing.T, sizeMB int) *testEnv {
+	t.Helper()
+
+	require.NotEmpty(t, sharedHostDir, "sharedHostDir must be initialized in TestMain")
+
+	_ = t.TempDir() // still create a per-test temp dir for any future use
+	imagePath := filepath.Join(sharedHostDir, fmt.Sprintf("test-%d.img", time.Now().UnixNano()))
+
+	builder, err := ext4fs.New(ext4fs.WithImagePath(imagePath), ext4fs.WithSizeInMB(sizeMB))
+	require.NoError(t, err, "failed to create ext4 image builder")
+
+	return &testEnv{
+		t:         t,
+		imagePath: imagePath,
+		builder:   builder,
+	}
+}
+
+// finalize saves the image and closes the builder, making it ready for mounting.
+func (e *testEnv) finalize() {
+	e.t.Helper()
+
+	err := e.builder.Save()
+	require.NoError(e.t, err, "failed to save image")
+
+	err = e.builder.Close()
+	require.NoError(e.t, err, "failed to close builder")
+}
+
+// dockerExec runs commands inside the long-lived Docker container with the
+// ext4 image mounted. It runs e2fsck for validation, mounts the filesystem,
+// executes the provided commands, and returns stdout/stderr.
+func (e *testEnv) dockerExec(commands ...string) (stdout, stderr string, err error) {
+	e.t.Helper()
+
+	if !dockerAvailable || dockerContainerID == "" {
+		return "", "", fmt.Errorf("docker test container not available")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	remoteImage := filepath.Join(sharedContainerDir, filepath.Base(e.imagePath))
+	mountDir := fmt.Sprintf("/mnt/ext4-%d", time.Now().UnixNano())
+
+	script := buildMountScript(remoteImage, mountDir, commands)
+
+	cmd := exec.CommandContext(ctx, "docker", "exec", "--privileged", dockerContainerID, "sh", "-c", script)
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err = cmd.Run()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return stdoutBuf.String(), stderrBuf.String(), fmt.Errorf("docker exec timed out after 60s")
+	}
+
+	return stdoutBuf.String(), stderrBuf.String(), err
+}
+
+// dockerExecSimple runs commands in Docker and returns combined stdout output.
+// It fails the test immediately if any command returns an error.
+func (e *testEnv) dockerExecSimple(commands ...string) string {
+	e.t.Helper()
+
+	stdout, stderr, err := e.dockerExec(commands...)
+	if err != nil {
+		e.t.Fatalf("docker exec failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+	}
+
+	return stdout
+}
+
+// -----------------------------------------------------------------------------
+// Docker Container Management
+// -----------------------------------------------------------------------------
+
+// startDockerContainer starts a privileged Alpine container with the shared
+// host directory mounted and necessary tools installed.
+func startDockerContainer() (string, error) {
+	volumeArg := fmt.Sprintf("%s:%s", sharedHostDir, sharedContainerDir)
+
+	cmd := exec.Command(
+		"docker", "run", "-d", "--privileged", "-v", volumeArg, dockerImage,
+		"sleep", "infinity",
+	)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("docker run failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	containerID := strings.TrimSpace(stdout.String())
+
+	installCmd := exec.Command(
+		"docker", "exec", containerID,
+		"apk", "add", "--no-cache", "e2fsprogs", "attr", "acl", "libcap",
+	)
+
+	if err := installCmd.Run(); err != nil {
+		_ = exec.Command("docker", "rm", "-f", containerID).Run()
+		return "", fmt.Errorf("failed to install packages: %w", err)
+	}
+
+	return containerID, nil
+}
+
+// stopDockerContainer stops and removes the test container.
+// This is best-effort cleanup; failures here should not mask test results.
+func stopDockerContainer(id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_ = exec.CommandContext(ctx, "docker", "stop", "-t", "5", id).Run()
+	_ = exec.CommandContext(ctx, "docker", "rm", id).Run()
+}
+
+// skipIfNoDocker skips the test if the shared Docker container is not available.
+func skipIfNoDocker(t *testing.T) {
+	t.Helper()
+
+	if !dockerAvailable || dockerContainerID == "" {
+		t.Skip("Docker test container not available, skipping e2e test")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Script Builder
+// -----------------------------------------------------------------------------
+
+// buildMountScript generates a shell script that mounts the ext4 image,
+// runs e2fsck, executes the specified commands, and cleans up.
+func buildMountScript(imagePath, mountDir string, commands []string) string {
+	return fmt.Sprintf(`
+set -e
+
+mkdir -p %[2]s
+
+cleanup() {
+	umount %[2]s 2>/dev/null || umount -l %[2]s 2>/dev/null || true
+}
+trap cleanup EXIT
+
+e2fsck -n -f %[1]s || { echo "e2fsck failed"; exit 1; }
+
+mount -t ext4 -o loop %[1]s %[2]s
+
+cd %[2]s
+%[3]s
+`, imagePath, mountDir, strings.Join(commands, "\n"))
+}
+
+// -----------------------------------------------------------------------------
+// Fixture Helpers
+// -----------------------------------------------------------------------------
+
+// buildAndHashFullFeaturesFixture builds the deterministic fixture image
+// and returns its size and sha256 hash.
+func buildAndHashFullFeaturesFixture(imagePath string) (size uint64, hash string, err error) {
 	_ = os.Remove(imagePath)
 
 	img, err := ext4fs.New(
@@ -1755,20 +1701,19 @@ func buildAndHashFullFeaturesFixture(imagePath string) (uint64, string, error) {
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to open image %q: %w", imagePath, err)
 	}
-	defer f.Close()
+	defer func() {
+		_ = f.Close()
+	}()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return 0, "", fmt.Errorf("failed to hash image %q: %w", imagePath, err)
 	}
 
-	sum := h.Sum(nil)
-
-	return uint64(info.Size()), hex.EncodeToString(sum), nil
+	return uint64(info.Size()), hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// buildFullFeaturesFixture builds the full-features filesystem layout used
-// by the deterministic fixture fingerprint test.
+// buildFullFeaturesFixture populates the image with the standard fixture layout.
 func buildFullFeaturesFixture(b *ext4fs.Image) error {
 	root := uint32(ext4fs.RootInode)
 
@@ -1777,8 +1722,7 @@ func buildFullFeaturesFixture(b *ext4fs.Image) error {
 		return fmt.Errorf("failed to create /etc: %w", err)
 	}
 
-	_, err = b.CreateFile(etcInode, "hostname", []byte("ext4-fixture\n"), 0o644, 0, 0)
-	if err != nil {
+	if _, err := b.CreateFile(etcInode, "hostname", []byte("ext4-fixture\n"), 0o644, 0, 0); err != nil {
 		return fmt.Errorf("failed to create /etc/hostname: %w", err)
 	}
 
@@ -1792,8 +1736,7 @@ func buildFullFeaturesFixture(b *ext4fs.Image) error {
 		return fmt.Errorf("failed to create /home/user: %w", err)
 	}
 
-	_, err = b.CreateFile(userInode, "note.txt", []byte("hello from ext4 fixtures\n"), 0o600, 1000, 1000)
-	if err != nil {
+	if _, err := b.CreateFile(userInode, "note.txt", []byte("hello from ext4 fixtures\n"), 0o600, 1000, 1000); err != nil {
 		return fmt.Errorf("failed to create /home/user/note.txt: %w", err)
 	}
 
@@ -1804,10 +1747,9 @@ func buildFullFeaturesFixture(b *ext4fs.Image) error {
 	return nil
 }
 
-// fixtureFingerprint computes the sha256 of "size:filehash".
-func fixtureFingerprint(size uint64, fileHash string) string {
+// computeFingerprint computes the sha256 of "size:filehash".
+func computeFingerprint(size uint64, fileHash string) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%d:%s", size, fileHash)
-
+	_, _ = fmt.Fprintf(h, "%d:%s", size, fileHash)
 	return hex.EncodeToString(h.Sum(nil))
 }

@@ -1,16 +1,21 @@
 GOLANGCI_LINT_VERSION := v2.6.2
 GOLANGCI_LINT_PATH := $(HOME)/.local/bin/golangci-lint-$(subst v,,$(GOLANGCI_LINT_VERSION))
+COVERAGE_PROFILE := /tmp/go-ext4fs-coverage.out
 
-.PHONY: test-e2e fixtures-check-matrix lint tests all
+.PHONY: lint tests coverage bench all
 
-all: lint tests
-
-GO_VERSIONS := 1.21.13 1.22.12 1.23.12 1.24.10 1.25.4
-PLATFORMS   := linux/amd64 linux/arm64
+all: fmt lint tests
 
 tests:
 	@echo "===> Running end-to-end tests"
 	go test -v ./...
+
+coverage:
+	@echo "===> Running tests with coverage"
+	go test -v -coverprofile=$(COVERAGE_PROFILE) -covermode=atomic ./...
+	@echo ""
+	@echo "===> Coverage report"
+	go tool cover -func=$(COVERAGE_PROFILE)
 
 $(GOLANGCI_LINT_PATH):
 	@echo "===> Installing golangci-lint $(GOLANGCI_LINT_VERSION)"
@@ -25,3 +30,7 @@ lint: $(GOLANGCI_LINT_PATH)
 fmt: $(GOLANGCI_LINT_PATH)
 	@echo "===> Running fmt"
 	@$(GOLANGCI_LINT_PATH) fmt
+
+bench:
+	@echo "===> Running benchmarks"
+	go test -bench=. -benchmem -run=^$ ./...

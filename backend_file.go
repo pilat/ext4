@@ -5,19 +5,25 @@ import (
 	"os"
 )
 
-// diskBackend abstracts I/O operations for different storage backends.
-// This interface allows the filesystem builder to work with various storage
-// types (files, memory buffers, network storage) through a common API.
-type diskBackend interface {
-	readAt(p []byte, off int64) (err error)
-	writeAt(p []byte, off int64) error
-}
-
 // fileBackend implements diskBackend using a regular file on disk.
 // Provides random access read/write operations for ext4 image files.
 // Includes additional methods for synchronization and resource cleanup.
 type fileBackend struct {
 	f *os.File
+}
+
+var _ diskBackend = (*fileBackend)(nil)
+
+func (fb *fileBackend) truncate(size int64) error {
+	if fb.f.Name() == "" {
+		return fmt.Errorf("imagePath is required")
+	}
+
+	if err := fb.f.Truncate(size); err != nil {
+		return fmt.Errorf("failed to truncate image file: %w", err)
+	}
+
+	return nil
 }
 
 func (fb *fileBackend) readAt(p []byte, off int64) error {

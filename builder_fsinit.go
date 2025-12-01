@@ -33,7 +33,7 @@ func (b *builder) writeSuperblock() error {
 		FirstInode:        firstNonResInode,
 		InodeSize:         inodeSize,
 		BlockGroupNr:      0,
-		FeatureCompat:     compatExtAttr | compatDirIndex,
+		FeatureCompat:     compatExtAttr,
 		FeatureIncompat:   incompatFileType | incompatExtents,
 		FeatureROCompat:   roCompatSparseSuper | roCompatLargeFile | roCompatExtraIsize,
 		MkfsTime:          b.layout.CreatedAt,

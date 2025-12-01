@@ -18,8 +18,6 @@ linters:
   exclusions:
     paths:
       - tmp
-      - cmd
-      - e2e_test\.go
 
 formatters:
   enable:
@@ -28,5 +26,3 @@ formatters:
   exclusions:
     paths:
       - tmp
-      - cmd
-      - e2e_test\.go

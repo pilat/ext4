@@ -4,22 +4,29 @@ Pure Go ext4 filesystem implementation for creating disk images without external
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/pilat/go-ext4fs.svg)](https://pkg.go.dev/github.com/pilat/go-ext4fs)
 [![Go Report Card](https://goreportcard.com/badge/github.com/pilat/go-ext4fs)](https://goreportcard.com/report/github.com/pilat/go-ext4fs)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+<!-- [![Go Version](https://img.shields.io/github/go-mod/go-version/pilat/go-ext4fs)](https://github.com/pilat/go-ext4fs)
+[![CI](https://github.com/pilat/go-ext4fs/actions/workflows/ci.yml/badge.svg)](https://github.com/pilat/go-ext4fs/actions/workflows/ci.yml) -->
+
+## Overview
+
+This library creates ext4 filesystem images suitable for small virtual machines and embedded systems. It's designed for building bootable disk images programmatically without requiring root privileges or external tools like `mke2fs`.
 
 ## Features
 
 - **Pure Go**: No external dependencies or system calls
-- **Full ext4 support**: Extents, extended attributes, symlinks, and more
-- **Docker integration**: End-to-end testing with Docker containers
+- **Extent-based**: Modern ext4 extent trees for efficient block mapping
+- **Extended attributes**: Full xattr support for security labels and metadata
+- **Symlinks**: Both fast (inline) and slow (block-based) symlinks
 - **Simple API**: Easy to use for creating filesystem images programmatically
+- **Docker integration**: End-to-end testing with real Linux kernel verification
 
 ## Installation
-
 ```bash
 go get github.com/pilat/go-ext4fs
 ```
 
 ## Quick Start
-
 ```go
 package main
 
@@ -68,6 +75,33 @@ func main() {
         panic(err)
     }
 }
+```
+
+## Limitations
+
+This library is optimized for creating simple disk images for small VMs. The following ext4 features are not implemented:
+
+| Feature | Impact |
+|---------|--------|
+| Journaling | No crash recovery (not needed for image creation) |
+| 64-bit block addresses | Maximum filesystem size ~16 TB |
+| Extent tree depth > 1 | Maximum ~1,360 extents per file; sufficient for contiguous files up to ~170 TB |
+| HTree directory indexing | Linear directory scan; fine for directories with fewer than ~1,000 files |
+
+For most VM use cases (boot disks, configuration filesystems, small data volumes), these limitations have no practical impact.
+
+## Verification
+
+Created images can be verified using standard Linux tools:
+```bash
+# Check filesystem integrity
+e2fsck -n -f disk.img
+
+# Mount and inspect (requires root)
+sudo mount -o loop disk.img /mnt
+
+# View filesystem info
+dumpe2fs disk.img
 ```
 
 ## License
