@@ -14,7 +14,7 @@ go get github.com/pilat/go-ext4fs
 package main
 
 import (
-    "github.com/pilat/ext4fs"
+    "github.com/pilat/go-ext4fs"
 )
 
 func main() {

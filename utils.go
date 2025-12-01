@@ -1,11 +1,11 @@
 package ext4fs
 
-// isSparseGroup checks if a group should have superblock backup (sparse superblock layout).
+// isSparseGroup checks if group should have superblock backup
 func isSparseGroup(group uint32) bool {
 	if group <= 1 {
 		return true
 	}
-	// Groups that are powers of 3, 5, or 7
+	// Powers of 3, 5, 7
 	for _, base := range []uint32{3, 5, 7} {
 		for n := base; n <= group; n *= base {
 			if n == group {
@@ -18,8 +18,6 @@ func isSparseGroup(group uint32) bool {
 
 // lbaToCHS converts LBA to CHS addressing (simplified, for compatibility only).
 func lbaToCHS(lba uint32) [3]byte {
-	// Simplified CHS calculation for modern systems
-	// Most systems use LBA, so this is mainly for compatibility
 	sectorsPerTrack := uint32(63)
 	heads := uint32(255)
 
