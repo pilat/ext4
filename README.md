@@ -5,12 +5,14 @@ Pure Go ext4 filesystem implementation for creating disk images without external
 [![Go Reference](https://pkg.go.dev/badge/github.com/pilat/go-ext4fs.svg)](https://pkg.go.dev/github.com/pilat/go-ext4fs)
 [![Go Report Card](https://goreportcard.com/badge/github.com/pilat/go-ext4fs)](https://goreportcard.com/report/github.com/pilat/go-ext4fs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-<!-- [![Go Version](https://img.shields.io/github/go-mod/go-version/pilat/go-ext4fs)](https://github.com/pilat/go-ext4fs)
-[![CI](https://github.com/pilat/go-ext4fs/actions/workflows/ci.yml/badge.svg)](https://github.com/pilat/go-ext4fs/actions/workflows/ci.yml) -->
+[![Go Version](https://img.shields.io/github/go-mod/go-version/pilat/go-ext4fs)](https://github.com/pilat/go-ext4fs)
+[![CI](https://github.com/pilat/go-ext4fs/actions/workflows/ci.yml/badge.svg)](https://github.com/pilat/go-ext4fs/actions/workflows/ci.yml)
 
 ## Overview
 
-This library creates ext4 filesystem images suitable for small virtual machines and embedded systems. It's designed for building bootable disk images programmatically without requiring root privileges or external tools like `mke2fs`.
+This library creates ext4 filesystem images suitable for virtual machines and embedded systems. It's designed for building disk images programmatically without requiring root privileges or external tools like `mke2fs`.
+
+> **Note**: This is a write-only library for *creating* ext4 images. Reading or modifying existing images is not supported.
 
 ## Features
 
@@ -86,7 +88,10 @@ This library is optimized for creating simple disk images for small VMs. The fol
 | Journaling | No crash recovery (not needed for image creation) |
 | 64-bit block addresses | Maximum filesystem size ~16 TB |
 | Extent tree depth > 1 | Maximum ~1,360 extents per file; sufficient for contiguous files up to ~170 TB |
-| HTree directory indexing | Linear directory scan; fine for directories with fewer than ~1,000 files |
+| HTree directory indexing | Linear directory scan; fine for small directories |
+| Inline data | Small files use regular blocks |
+| Encryption | No at-rest encryption support |
+| Quotas | No user/group quota tracking |
 
 For most VM use cases (boot disks, configuration filesystems, small data volumes), these limitations have no practical impact.
 
