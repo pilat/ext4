@@ -452,38 +452,6 @@ func (b *builder) setXattr(inodeNum uint32, name string, value []byte) error {
 	return nil
 }
 
-// getXattr retrieves the value of an extended attribute from the specified inode.
-// Returns the attribute value as a byte slice, or an error if the attribute doesn't exist.
-// This method is primarily used for testing and validation purposes.
-func (b *builder) getXattr(inodeNum uint32, name string) ([]byte, error) {
-	nameIndex, shortName, err := parseXattrName(name)
-	if err != nil {
-		return nil, err
-	}
-
-	inode, err := b.readInode(inodeNum)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read inode for xattr: %w", err)
-	}
-
-	if inode.FileACLLo == 0 {
-		return nil, fmt.Errorf("no xattrs on inode %d", inodeNum)
-	}
-
-	entries, err := b.readXattrBlock(inode.FileACLLo)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read xattr block: %w", err)
-	}
-
-	for _, e := range entries {
-		if e.NameIndex == nameIndex && e.Name == shortName {
-			return e.Value, nil
-		}
-	}
-
-	return nil, fmt.Errorf("xattr %s not found", name)
-}
-
 // listXattrs returns a list of all extended attribute names associated with the specified inode.
 // The returned names include their namespace prefixes (e.g., "user.attr", "trusted.security").
 // Returns an empty slice if the inode has no extended attributes.

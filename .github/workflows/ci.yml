@@ -49,11 +49,18 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: ${{ env.GO_VERSION_STABLE }}
           cache: true
 
       - name: Pull Alpine image
-        run: docker pull alpine:latest
+        run: docker pull alpine:3.22.2
 
-      - name: Run tests
-        run: make tests
+      - name: Run tests with coverage
+        run: go test ./... -coverprofile=coverage.txt -covermode=atomic
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.txt
+          fail_ci_if_error: true

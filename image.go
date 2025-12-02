@@ -85,12 +85,6 @@ func (e *Image) SetXattr(inodeNum uint32, name string, value []byte) error {
 	return e.builder.setXattr(inodeNum, name, value)
 }
 
-// GetXattr retrieves the value of an extended attribute from the specified inode.
-// Returns the attribute value as a byte slice, or an error if the attribute doesn't exist.
-func (e *Image) GetXattr(inodeNum uint32, name string) ([]byte, error) {
-	return e.builder.getXattr(inodeNum, name)
-}
-
 // ListXattrs returns a list of all extended attribute names for the specified inode.
 // Names include their namespace prefixes (e.g., "user.attr", "trusted.security").
 func (e *Image) ListXattrs(inodeNum uint32) ([]string, error) {
