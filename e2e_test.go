@@ -151,6 +151,23 @@ func TestExt4FS(t *testing.T) {
 		{"XattrManyFiles", testXattrManyFiles},
 		{"XattrEmpty", testXattrEmpty},
 		{"XattrPosixACL", testXattrPosixACL},
+		{"DeleteFile", testDeleteFile},
+		{"DeleteSymlink", testDeleteSymlink},
+		{"DeleteEmptyDirectory", testDeleteEmptyDirectory},
+		{"DeleteNonEmptyDirectoryFails", testDeleteNonEmptyDirectoryFails},
+		{"DeleteDirectoryRecursive", testDeleteDirectoryRecursive},
+		{"DeleteAndRecreate", testDeleteAndRecreate},
+		{"DeleteFileWithXattr", testDeleteFileWithXattr},
+		{"DeleteInSubdirectory", testDeleteInSubdirectory},
+		{"DeleteMultipleFiles", testDeleteMultipleFiles},
+		{"DeleteDirectoryDeep", testDeleteDirectoryDeep},
+		{"DeleteLargeFile", testDeleteLargeFile},
+		{"DeleteSlowSymlink", testDeleteSlowSymlink},
+		{"DeleteDirectoryWithXattr", testDeleteDirectoryWithXattr},
+		{"DeleteNotFound", testDeleteNotFound},
+		{"DeleteDotDotFails", testDeleteDotDotFails},
+		{"DeleteFirstEntry", testDeleteFirstEntry},
+		{"DeleteStressTest", testDeleteStressTest},
 	}
 
 	for _, tc := range tests {
@@ -1559,6 +1576,531 @@ func testXattrPosixACL(t *testing.T) {
 	)
 
 	assert.NotEmpty(t, output)
+}
+
+func testDeleteFile(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Create a file and then delete it
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "to_delete.txt", []byte("delete me"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "keep.txt", []byte("keep me"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Delete(ext4fs.RootInode, "to_delete.txt")
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -f "keep.txt" && echo "keep.txt exists"`,
+		`test -f "to_delete.txt" && echo "to_delete.txt exists" || echo "to_delete.txt deleted"`,
+		`cat keep.txt`,
+	)
+
+	assert.Contains(t, output, "keep.txt exists")
+	assert.Contains(t, output, "to_delete.txt deleted")
+	assert.Contains(t, output, "keep me")
+}
+
+func testDeleteSymlink(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "target.txt", []byte("target content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateSymlink(ext4fs.RootInode, "link.txt", "target.txt", 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Delete(ext4fs.RootInode, "link.txt")
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -f "target.txt" && echo "target.txt exists"`,
+		`test -L "link.txt" && echo "link.txt exists" || echo "link.txt deleted"`,
+		`cat target.txt`,
+	)
+
+	assert.Contains(t, output, "target.txt exists")
+	assert.Contains(t, output, "link.txt deleted")
+	assert.Contains(t, output, "target content")
+}
+
+func testDeleteEmptyDirectory(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	_, err := env.builder.CreateDirectory(ext4fs.RootInode, "empty_dir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Delete(ext4fs.RootInode, "empty_dir")
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -d "empty_dir" && echo "empty_dir exists" || echo "empty_dir deleted"`,
+	)
+
+	assert.Contains(t, output, "empty_dir deleted")
+}
+
+func testDeleteNonEmptyDirectoryFails(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "non_empty", 0755, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(dir, "file.txt", []byte("content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Delete should fail because directory is not empty
+	err = env.builder.Delete(ext4fs.RootInode, "non_empty")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not empty")
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -d "non_empty" && echo "non_empty exists"`,
+		`test -f "non_empty/file.txt" && echo "file.txt exists"`,
+	)
+
+	assert.Contains(t, output, "non_empty exists")
+	assert.Contains(t, output, "file.txt exists")
+}
+
+func testDeleteDirectoryRecursive(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Create a directory tree
+	dir1, err := env.builder.CreateDirectory(ext4fs.RootInode, "dir1", 0755, 0, 0)
+	require.NoError(t, err)
+
+	dir2, err := env.builder.CreateDirectory(dir1, "dir2", 0755, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(dir1, "file1.txt", []byte("file1"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(dir2, "file2.txt", []byte("file2"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateSymlink(dir2, "link.txt", "../file1.txt", 0, 0)
+	require.NoError(t, err)
+
+	// Keep another file at root level
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "keep.txt", []byte("keep"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Delete directory recursively
+	err = env.builder.DeleteDirectory(ext4fs.RootInode, "dir1")
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -d "dir1" && echo "dir1 exists" || echo "dir1 deleted"`,
+		`test -f "keep.txt" && echo "keep.txt exists"`,
+		`cat keep.txt`,
+	)
+
+	assert.Contains(t, output, "dir1 deleted")
+	assert.Contains(t, output, "keep.txt exists")
+	assert.Contains(t, output, "keep")
+}
+
+func testDeleteAndRecreate(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Create, delete, recreate file
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "recreate.txt", []byte("original"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Delete(ext4fs.RootInode, "recreate.txt")
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "recreate.txt", []byte("new content"), 0755, 1000, 1000)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -f "recreate.txt" && echo "file exists"`,
+		`cat recreate.txt`,
+		`stat -c "%a" recreate.txt`,
+		`stat -c "%u:%g" recreate.txt`,
+	)
+
+	assert.Contains(t, output, "file exists")
+	assert.Contains(t, output, "new content")
+	assert.NotContains(t, output, "original")
+	assert.Contains(t, output, "755")
+	assert.Contains(t, output, "1000:1000")
+}
+
+func testDeleteFileWithXattr(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "xattr_file.txt", []byte("content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.SetXattr(fileInode, "user.attr1", []byte("value1"))
+	require.NoError(t, err)
+
+	err = env.builder.SetXattr(fileInode, "user.attr2", []byte("value2"))
+	require.NoError(t, err)
+
+	// Delete the file (should also free xattr block)
+	err = env.builder.Delete(ext4fs.RootInode, "xattr_file.txt")
+	require.NoError(t, err)
+
+	// Create another file to reuse freed blocks
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "new_file.txt", []byte("new content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -f "xattr_file.txt" && echo "xattr_file.txt exists" || echo "xattr_file.txt deleted"`,
+		`test -f "new_file.txt" && echo "new_file.txt exists"`,
+		`cat new_file.txt`,
+	)
+
+	assert.Contains(t, output, "xattr_file.txt deleted")
+	assert.Contains(t, output, "new_file.txt exists")
+	assert.Contains(t, output, "new content")
+}
+
+func testDeleteInSubdirectory(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(dir, "file1.txt", []byte("file1"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(dir, "file2.txt", []byte("file2"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(dir, "file3.txt", []byte("file3"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Delete middle file
+	err = env.builder.Delete(dir, "file2.txt")
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -d "subdir" && echo "subdir exists"`,
+		`test -f "subdir/file1.txt" && echo "file1.txt exists"`,
+		`test -f "subdir/file2.txt" && echo "file2.txt exists" || echo "file2.txt deleted"`,
+		`test -f "subdir/file3.txt" && echo "file3.txt exists"`,
+		`ls subdir | wc -l | tr -d ' '`,
+	)
+
+	assert.Contains(t, output, "subdir exists")
+	assert.Contains(t, output, "file1.txt exists")
+	assert.Contains(t, output, "file2.txt deleted")
+	assert.Contains(t, output, "file3.txt exists")
+	assert.Contains(t, output, "2")
+}
+
+func testDeleteMultipleFiles(t *testing.T) {
+	env := newTestEnv(t, 128)
+
+	// Create many files
+	for i := 0; i < 100; i++ {
+		filename := fmt.Sprintf("file_%03d.txt", i)
+		_, err := env.builder.CreateFile(ext4fs.RootInode, filename, []byte(fmt.Sprintf("content %d", i)), 0644, 0, 0)
+		require.NoError(t, err)
+	}
+
+	// Delete every other file
+	for i := 0; i < 100; i += 2 {
+		filename := fmt.Sprintf("file_%03d.txt", i)
+		err := env.builder.Delete(ext4fs.RootInode, filename)
+		require.NoError(t, err)
+	}
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`ls -1 file_*.txt | wc -l | tr -d ' '`,
+		`test -f "file_001.txt" && echo "file_001.txt exists"`,
+		`test -f "file_000.txt" && echo "file_000.txt exists" || echo "file_000.txt deleted"`,
+		`test -f "file_099.txt" && echo "file_099.txt exists"`,
+		`test -f "file_098.txt" && echo "file_098.txt exists" || echo "file_098.txt deleted"`,
+	)
+
+	assert.Contains(t, output, "50")
+	assert.Contains(t, output, "file_001.txt exists")
+	assert.Contains(t, output, "file_000.txt deleted")
+	assert.Contains(t, output, "file_099.txt exists")
+	assert.Contains(t, output, "file_098.txt deleted")
+}
+
+func testDeleteDirectoryDeep(t *testing.T) {
+	env := newTestEnv(t, 128)
+
+	// Create a deep directory structure
+	parent := uint32(ext4fs.RootInode)
+	for i := 0; i < 10; i++ {
+		dirName := fmt.Sprintf("level%d", i)
+		dir, err := env.builder.CreateDirectory(parent, dirName, 0755, 0, 0)
+		require.NoError(t, err)
+
+		// Add some files at each level
+		for j := 0; j < 5; j++ {
+			fileName := fmt.Sprintf("file%d.txt", j)
+			_, err = env.builder.CreateFile(dir, fileName, []byte(fmt.Sprintf("content %d-%d", i, j)), 0644, 0, 0)
+			require.NoError(t, err)
+		}
+
+		parent = dir
+	}
+
+	// Keep a file at root
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "root_file.txt", []byte("root"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Delete the entire tree from root
+	err = env.builder.DeleteDirectory(ext4fs.RootInode, "level0")
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -d "level0" && echo "level0 exists" || echo "level0 deleted"`,
+		`test -f "root_file.txt" && echo "root_file.txt exists"`,
+		`cat root_file.txt`,
+	)
+
+	assert.Contains(t, output, "level0 deleted")
+	assert.Contains(t, output, "root_file.txt exists")
+	assert.Contains(t, output, "root")
+}
+
+func testDeleteLargeFile(t *testing.T) {
+	env := newTestEnv(t, 128)
+
+	// Create a large file that uses multiple extents (>4 extents triggers extent tree)
+	largeContent := make([]byte, 100*4096) // 100 blocks = 400KB
+	for i := range largeContent {
+		largeContent[i] = byte(i % 256)
+	}
+
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "large_file.bin", largeContent, 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Create another file to fragment allocation
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "small.txt", []byte("small"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Delete the large file
+	err = env.builder.Delete(ext4fs.RootInode, "large_file.bin")
+	require.NoError(t, err)
+
+	// Create a new file to reuse freed blocks
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "reuse.txt", []byte("reused blocks"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -f "large_file.bin" && echo "large exists" || echo "large deleted"`,
+		`test -f "small.txt" && echo "small exists"`,
+		`test -f "reuse.txt" && echo "reuse exists"`,
+		`cat reuse.txt`,
+	)
+
+	assert.Contains(t, output, "large deleted")
+	assert.Contains(t, output, "small exists")
+	assert.Contains(t, output, "reuse exists")
+	assert.Contains(t, output, "reused blocks")
+}
+
+func testDeleteSlowSymlink(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Create a slow symlink (>60 bytes, stored in a data block)
+	longTarget := "/very/long/path/that/exceeds/sixty/bytes/to/trigger/slow/symlink/storage/mechanism"
+	_, err := env.builder.CreateSymlink(ext4fs.RootInode, "slow_link", longTarget, 0, 0)
+	require.NoError(t, err)
+
+	// Delete the slow symlink
+	err = env.builder.Delete(ext4fs.RootInode, "slow_link")
+	require.NoError(t, err)
+
+	// Create a file to potentially reuse the freed block
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "after_delete.txt", []byte("after"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -L "slow_link" && echo "symlink exists" || echo "symlink deleted"`,
+		`test -f "after_delete.txt" && echo "after exists"`,
+		`cat after_delete.txt`,
+	)
+
+	assert.Contains(t, output, "symlink deleted")
+	assert.Contains(t, output, "after exists")
+	assert.Contains(t, output, "after")
+}
+
+func testDeleteDirectoryWithXattr(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Create directory with xattrs
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "xattr_dir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.SetXattr(dir, "user.dir_attr", []byte("dir_value"))
+	require.NoError(t, err)
+
+	err = env.builder.SetXattr(dir, "security.selinux", []byte("system_u:object_r:var_t:s0\x00"))
+	require.NoError(t, err)
+
+	// Delete the directory (should free xattr block too)
+	err = env.builder.Delete(ext4fs.RootInode, "xattr_dir")
+	require.NoError(t, err)
+
+	// Create a new directory to reuse resources
+	_, err = env.builder.CreateDirectory(ext4fs.RootInode, "new_dir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -d "xattr_dir" && echo "xattr_dir exists" || echo "xattr_dir deleted"`,
+		`test -d "new_dir" && echo "new_dir exists"`,
+	)
+
+	assert.Contains(t, output, "xattr_dir deleted")
+	assert.Contains(t, output, "new_dir exists")
+}
+
+func testDeleteNotFound(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Try to delete non-existent file
+	err := env.builder.Delete(ext4fs.RootInode, "does_not_exist.txt")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+
+	// Try to delete non-existent directory
+	err = env.builder.DeleteDirectory(ext4fs.RootInode, "does_not_exist_dir")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+
+	env.finalize()
+
+	// Just verify filesystem is valid
+	output := env.dockerExecSimple(`echo "filesystem valid"`)
+	assert.Contains(t, output, "filesystem valid")
+}
+
+func testDeleteDotDotFails(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "testdir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	// Try to delete "."
+	err = env.builder.Delete(dir, ".")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `cannot delete "."`)
+
+	// Try to delete ".."
+	err = env.builder.Delete(dir, "..")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `cannot delete ".."`)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -d "testdir" && echo "testdir exists"`,
+	)
+
+	assert.Contains(t, output, "testdir exists")
+}
+
+func testDeleteFirstEntry(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Create files in order: first, second, third
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "aaa_first.txt", []byte("first"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "bbb_second.txt", []byte("second"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "ccc_third.txt", []byte("third"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Delete the first entry (after . and .. and lost+found)
+	err = env.builder.Delete(ext4fs.RootInode, "aaa_first.txt")
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -f "aaa_first.txt" && echo "first exists" || echo "first deleted"`,
+		`test -f "bbb_second.txt" && echo "second exists"`,
+		`test -f "ccc_third.txt" && echo "third exists"`,
+		`cat bbb_second.txt`,
+		`cat ccc_third.txt`,
+	)
+
+	assert.Contains(t, output, "first deleted")
+	assert.Contains(t, output, "second exists")
+	assert.Contains(t, output, "third exists")
+	assert.Contains(t, output, "second")
+	assert.Contains(t, output, "third")
+}
+
+func testDeleteStressTest(t *testing.T) {
+	env := newTestEnv(t, 128)
+
+	// Create 200 files
+	for i := 0; i < 200; i++ {
+		filename := fmt.Sprintf("stress_%03d.txt", i)
+		_, err := env.builder.CreateFile(ext4fs.RootInode, filename, []byte(fmt.Sprintf("content %d", i)), 0644, 0, 0)
+		require.NoError(t, err)
+	}
+
+	// Delete all 200 files
+	for i := 0; i < 200; i++ {
+		filename := fmt.Sprintf("stress_%03d.txt", i)
+		err := env.builder.Delete(ext4fs.RootInode, filename)
+		require.NoError(t, err)
+	}
+
+	// Create 200 new files (should reuse freed inodes and blocks)
+	for i := 0; i < 200; i++ {
+		filename := fmt.Sprintf("new_%03d.txt", i)
+		_, err := env.builder.CreateFile(ext4fs.RootInode, filename, []byte(fmt.Sprintf("new content %d", i)), 0644, 0, 0)
+		require.NoError(t, err)
+	}
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`ls -1 stress_*.txt 2>/dev/null | wc -l | tr -d ' '`,
+		`ls -1 new_*.txt | wc -l | tr -d ' '`,
+		`cat new_000.txt`,
+		`cat new_199.txt`,
+	)
+
+	assert.Contains(t, output, "0")   // No stress_* files should exist
+	assert.Contains(t, output, "200") // All new_* files should exist
+	assert.Contains(t, output, "new content 0")
+	assert.Contains(t, output, "new content 199")
 }
 
 // =============================================================================

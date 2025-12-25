@@ -2,17 +2,23 @@ GOLANGCI_LINT_VERSION := v2.6.2
 GOLANGCI_LINT_PATH := $(HOME)/.local/bin/golangci-lint-$(subst v,,$(GOLANGCI_LINT_VERSION))
 COVERAGE_PROFILE := /tmp/go-ext4fs-coverage.out
 
+# Linker flags for macOS compatibility with Go < 1.24 (LC_UUID issue)
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    LDFLAGS := -ldflags="-linkmode=external"
+endif
+
 .PHONY: lint tests coverage bench all
 
 all: fmt lint tests
 
 tests:
 	@echo "===> Running end-to-end tests"
-	go test -v ./...
+	go test $(LDFLAGS) -v ./...
 
 coverage:
 	@echo "===> Running tests with coverage"
-	go test -v -coverprofile=$(COVERAGE_PROFILE) -covermode=atomic ./...
+	go test $(LDFLAGS) -v -coverprofile=$(COVERAGE_PROFILE) -covermode=atomic ./...
 	@echo ""
 	@echo "===> Coverage report"
 	go tool cover -func=$(COVERAGE_PROFILE)

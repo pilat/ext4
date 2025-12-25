@@ -180,6 +180,36 @@ func (b *builder) markBlockUsed(blockNum uint32) error {
 	return nil
 }
 
+// freeInode marks the specified inode as free in its group's inode bitmap.
+// This allows the inode to be reused for future allocations.
+// Inode 0 is invalid and should never be freed.
+func (b *builder) freeInode(inodeNum uint32) error {
+	if inodeNum < 1 {
+		return nil
+	}
+
+	group := (inodeNum - 1) / inodesPerGroup
+	indexInGroup := (inodeNum - 1) % inodesPerGroup
+
+	gl := b.layout.GetGroupLayout(group)
+	offset := b.layout.BlockOffset(gl.InodeBitmapBlock) + uint64(indexInGroup/8)
+
+	var buf [1]byte
+	if err := b.disk.readAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("failed to read inode bitmap for freeing inode %d: %w", inodeNum, err)
+	}
+
+	buf[0] &^= 1 << (indexInGroup % 8) // Clear the bit
+	if err := b.disk.writeAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("failed to write inode bitmap for freeing inode %d: %w", inodeNum, err)
+	}
+
+	// Track freed inodes for accurate count
+	b.freedInodesPerGroup[group]++
+
+	return nil
+}
+
 // markInodeUsed marks the specified inode as used in its group's inode bitmap.
 // This prevents the inode from being allocated again and updates the bitmap on disk.
 // Inode 0 is invalid and should never be marked as used.

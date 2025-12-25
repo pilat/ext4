@@ -98,6 +98,21 @@ func (e *Image) RemoveXattr(inodeNum uint32, name string) error {
 	return e.builder.removeXattr(inodeNum, name)
 }
 
+// Delete removes a file, symlink, or empty directory from the parent directory.
+// Returns an error if the entry is a non-empty directory (use DeleteDirectory instead).
+// This is similar to os.Remove behavior.
+func (e *Image) Delete(parent uint32, name string) error {
+	return e.builder.deleteEntry(parent, name)
+}
+
+// DeleteDirectory recursively removes a directory and all its contents.
+// This is similar to os.RemoveAll behavior - it deletes everything without
+// checking if subdirectories are empty.
+// Returns an error if the entry is not a directory.
+func (e *Image) DeleteDirectory(parent uint32, name string) error {
+	return e.builder.deleteDirectory(parent, name)
+}
+
 // Save finalizes the filesystem and saves the image to disk.
 // This includes finalizing the metadata, syncing the image, and closing the backend.
 // Returns an error if the operation fails.

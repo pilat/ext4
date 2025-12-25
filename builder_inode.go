@@ -229,6 +229,26 @@ func (b *builder) incrementLinkCount(inodeNum uint32) error {
 	return nil
 }
 
+// decrementLinkCount decreases the hard link count for the specified inode.
+// Returns the new link count after decrementing.
+// This is called when a directory entry referencing the inode is removed.
+func (b *builder) decrementLinkCount(inodeNum uint32) (uint16, error) {
+	inode, err := b.readInode(inodeNum)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read inode for link count decrement: %w", err)
+	}
+
+	if inode.LinksCount > 0 {
+		inode.LinksCount--
+	}
+
+	if err := b.writeInode(inodeNum, inode); err != nil {
+		return 0, fmt.Errorf("failed to write inode after decrementing link count: %w", err)
+	}
+
+	return inode.LinksCount, nil
+}
+
 // addBlockToInode adds a new block to a directory inode's extent tree.
 // Used when a directory grows beyond its current block allocation.
 // May convert from simple extents to indexed extents for large directories.

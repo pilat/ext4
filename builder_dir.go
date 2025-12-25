@@ -159,6 +159,64 @@ func (b *builder) tryAddEntryToBlock(blockNum uint32, entry dirEntry, newRecLen 
 	return true, nil
 }
 
+// removeDirEntry removes a directory entry with the specified name from the directory.
+// The entry is removed by expanding the previous entry's rec_len to absorb the deleted entry,
+// or by setting inode=0 if it's the first entry in a block.
+// Returns an error if the entry is not found.
+func (b *builder) removeDirEntry(dirInode uint32, name string) error {
+	inode, err := b.readInode(dirInode)
+	if err != nil {
+		return fmt.Errorf("failed to read directory inode for entry removal: %w", err)
+	}
+
+	dataBlocks, err := b.getInodeBlocks(inode)
+	if err != nil {
+		return fmt.Errorf("failed to get directory blocks for entry removal: %w", err)
+	}
+
+	for _, blockNum := range dataBlocks {
+		block := make([]byte, blockSize)
+		if err := b.disk.readAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+			return fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
+		}
+
+		offset := 0
+		prevOffset := -1
+
+		for offset < blockSize {
+			recLen := binary.LittleEndian.Uint16(block[offset+4:])
+			if recLen == 0 {
+				break
+			}
+
+			nameLen := int(block[offset+6])
+			entryName := string(block[offset+8 : offset+8+nameLen])
+
+			if entryName == name {
+				if prevOffset < 0 {
+					// First entry in block: set inode to 0 to mark as unused
+					binary.LittleEndian.PutUint32(block[offset:], 0)
+				} else {
+					// Not first entry: expand previous entry's rec_len
+					prevRecLen := binary.LittleEndian.Uint16(block[prevOffset+4:])
+					binary.LittleEndian.PutUint16(block[prevOffset+4:], prevRecLen+recLen)
+				}
+
+				if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+					return fmt.Errorf("failed to write directory block %d: %w", blockNum, err)
+				}
+
+				return nil
+			}
+
+			prevOffset = offset
+			offset += int(recLen)
+		}
+	}
+
+	return fmt.Errorf("entry %q not found in directory", name)
+}
+
 // findEntry searches for a directory entry with the specified name.
 // Returns the inode number if found, or 0 if the entry doesn't exist.
 // Used to check for existing files before creation or overwriting.
@@ -198,4 +256,56 @@ func (b *builder) findEntry(dirInode uint32, name string) (uint32, error) {
 	}
 
 	return 0, nil
+}
+
+// listDirEntries returns all directory entries in the specified directory.
+// Skips entries with inode=0 (deleted entries) and "." / ".." entries.
+// Returns a slice of dirEntry containing name, inode, and type for each entry.
+func (b *builder) listDirEntries(dirInode uint32) ([]dirEntry, error) {
+	inode, err := b.readInode(dirInode)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read directory inode: %w", err)
+	}
+
+	dataBlocks, err := b.getInodeBlocks(inode)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get directory blocks: %w", err)
+	}
+
+	var entries []dirEntry
+
+	for _, blockNum := range dataBlocks {
+		block := make([]byte, blockSize)
+		if err := b.disk.readAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+			return nil, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
+		}
+
+		offset := 0
+		for offset < blockSize {
+			recLen := binary.LittleEndian.Uint16(block[offset+4:])
+			if recLen == 0 {
+				break
+			}
+
+			entryInode := binary.LittleEndian.Uint32(block[offset:])
+			if entryInode != 0 {
+				nameLen := int(block[offset+6])
+				entryName := string(block[offset+8 : offset+8+nameLen])
+				entryType := block[offset+7]
+
+				// Skip "." and ".."
+				if entryName != "." && entryName != ".." {
+					entries = append(entries, dirEntry{
+						Inode: entryInode,
+						Type:  entryType,
+						Name:  []byte(entryName),
+					})
+				}
+			}
+
+			offset += int(recLen)
+		}
+	}
+
+	return entries, nil
 }

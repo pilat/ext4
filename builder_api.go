@@ -209,6 +209,9 @@ func (b *builder) calculateGroupStats(g uint32) (uint16, uint16, uint16) {
 		}
 	}
 
+	// Account for freed inodes
+	usedInodes -= uint16(b.freedInodesPerGroup[g])
+
 	freeInodes := uint16(inodesPerGroup) - usedInodes
 	itableUnused := uint16(inodesPerGroup - highestUsedInode)
 
@@ -366,6 +369,134 @@ func (b *builder) createSymlink(parentInode uint32, name, target string, uid, gi
 	}
 
 	return inodeNum, nil
+}
+
+// freeInodeResources frees all resources associated with an inode (blocks, xattr, bitmap).
+func (b *builder) freeInodeResources(entryInode uint32, inode *inode) error {
+	if err := b.freeOldFileResources(inode); err != nil {
+		return fmt.Errorf("failed to free entry resources: %w", err)
+	}
+
+	inode.LinksCount = 0
+	inode.Dtime = b.layout.CreatedAt
+	if err := b.writeInode(entryInode, inode); err != nil {
+		return fmt.Errorf("failed to update deleted inode: %w", err)
+	}
+
+	if err := b.freeInode(entryInode); err != nil {
+		return fmt.Errorf("failed to free inode: %w", err)
+	}
+
+	return nil
+}
+
+// deleteEntry removes a file, symlink, or empty directory from the parent directory.
+// For directories, returns an error if the directory is not empty (use deleteDirectory instead).
+// The entry's inode and data blocks are freed when the link count reaches zero.
+func (b *builder) deleteEntry(parentInode uint32, name string) error {
+	if name == "." || name == ".." {
+		return fmt.Errorf("cannot delete %q", name)
+	}
+
+	entryInode, err := b.findEntry(parentInode, name)
+	if err != nil {
+		return fmt.Errorf("failed to find entry: %w", err)
+	}
+	if entryInode == 0 {
+		return fmt.Errorf("entry %q not found", name)
+	}
+
+	inode, err := b.readInode(entryInode)
+	if err != nil {
+		return fmt.Errorf("failed to read entry inode: %w", err)
+	}
+
+	isDir := (inode.Mode & s_IFDIR) != 0
+	if isDir {
+		entries, err := b.listDirEntries(entryInode)
+		if err != nil {
+			return fmt.Errorf("failed to list directory entries: %w", err)
+		}
+		if len(entries) > 0 {
+			return fmt.Errorf("directory %q is not empty", name)
+		}
+	}
+
+	if err := b.freeInodeResources(entryInode, inode); err != nil {
+		return err
+	}
+
+	if err := b.removeDirEntry(parentInode, name); err != nil {
+		return fmt.Errorf("failed to remove directory entry: %w", err)
+	}
+
+	if isDir {
+		if _, err := b.decrementLinkCount(parentInode); err != nil {
+			return fmt.Errorf("failed to decrement parent link count: %w", err)
+		}
+		group := (entryInode - 1) / inodesPerGroup
+		if b.usedDirsPerGroup[group] > 0 {
+			b.usedDirsPerGroup[group]--
+		}
+	}
+
+	if b.debug {
+		fmt.Printf("✓ Deleted entry: %s (inode %d)\n", name, entryInode)
+	}
+
+	return nil
+}
+
+// deleteDirectory recursively removes a directory and all its contents.
+// This is equivalent to "rm -rf" behavior - it deletes files, symlinks,
+// and subdirectories without checking if they are empty.
+func (b *builder) deleteDirectory(parentInode uint32, name string) error {
+	if name == "." || name == ".." {
+		return fmt.Errorf("cannot delete %q", name)
+	}
+
+	// Find the entry
+	entryInode, err := b.findEntry(parentInode, name)
+	if err != nil {
+		return fmt.Errorf("failed to find entry: %w", err)
+	}
+
+	if entryInode == 0 {
+		return fmt.Errorf("entry %q not found", name)
+	}
+
+	// Read the inode to verify it's a directory
+	inode, err := b.readInode(entryInode)
+	if err != nil {
+		return fmt.Errorf("failed to read entry inode: %w", err)
+	}
+
+	if (inode.Mode & s_IFDIR) == 0 {
+		return fmt.Errorf("%q is not a directory", name)
+	}
+
+	// List all entries in the directory
+	entries, err := b.listDirEntries(entryInode)
+	if err != nil {
+		return fmt.Errorf("failed to list directory entries: %w", err)
+	}
+
+	// Recursively delete all entries
+	for _, entry := range entries {
+		entryName := string(entry.Name)
+		if entry.Type == ftDir {
+			if err := b.deleteDirectory(entryInode, entryName); err != nil {
+				return fmt.Errorf("failed to delete subdirectory %q: %w", entryName, err)
+			}
+		} else {
+			if err := b.deleteEntry(entryInode, entryName); err != nil {
+				return fmt.Errorf("failed to delete entry %q: %w", entryName, err)
+			}
+		}
+	}
+
+	// Now the directory is empty, delete it
+	return b.deleteEntry(parentInode, name)
 }
 
 // setXattr sets an extended attribute (xattr) on the specified inode.
@@ -562,7 +693,13 @@ func (b *builder) finalizeMetadata() error {
 		totalFreeBlocks += gl.BlocksInGroup - usedBlocks
 	}
 
-	totalFreeInodes := b.layout.TotalInodes() - (b.nextInode - 1)
+	// Calculate total freed inodes across all groups
+	var totalFreedInodes uint32
+	for g := uint32(0); g < b.layout.GroupCount; g++ {
+		totalFreedInodes += b.freedInodesPerGroup[g]
+	}
+
+	totalFreeInodes := b.layout.TotalInodes() - (b.nextInode - 1) + totalFreedInodes
 
 	if err := b.updateSuperblocks(totalFreeBlocks, totalFreeInodes); err != nil {
 		return err

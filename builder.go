@@ -16,6 +16,7 @@ type builder struct {
 	freedBlocksPerGroup []uint32 // Blocks freed per group (for overwrites)
 	freeBlockList       []uint32 // List of freed blocks available for reuse
 	nextInode           uint32   // Next free inode (global)
+	freedInodesPerGroup []uint32 // Inodes freed per group (for deletes)
 
 	// Tracking
 	usedDirsPerGroup []uint16 // Directory count per group
@@ -33,6 +34,7 @@ func newBuilder(disk diskBackend, layout *Layout) *builder {
 		freedBlocksPerGroup: make([]uint32, layout.GroupCount),
 		freeBlockList:       make([]uint32, 0),
 		nextInode:           firstNonResInode,
+		freedInodesPerGroup: make([]uint32, layout.GroupCount),
 		usedDirsPerGroup:    make([]uint16, layout.GroupCount),
 	}
 
