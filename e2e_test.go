@@ -170,6 +170,10 @@ func TestExt4FS(t *testing.T) {
 		{"DeleteFirstEntry", testDeleteFirstEntry},
 		{"DeleteStressTest", testDeleteStressTest},
 		{"InodeReuse", testInodeReuse},
+		{"OpenAndModify", testOpenAndModify},
+		{"OpenAndAddFile", testOpenAndAddFile},
+		{"OpenAndDeleteFile", testOpenAndDeleteFile},
+		{"OpenInvalidImage", testOpenInvalidImage},
 	}
 
 	for _, tc := range tests {
@@ -2248,6 +2252,153 @@ func testInodeReuse(t *testing.T) {
 	assert.Contains(t, output, "new_a")
 	assert.Contains(t, output, "new_b")
 	assert.Contains(t, output, "new_c")
+}
+
+func testOpenAndModify(t *testing.T) {
+	// Create initial image with a file
+	env := newTestEnv(t, defaultImageSizeMB)
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "hello.txt", []byte("hello world"), 0644, 0, 0)
+	require.NoError(t, err)
+	env.finalize()
+
+	// Verify initial file exists
+	output := env.dockerExecSimple(`cat hello.txt`)
+	assert.Contains(t, output, "hello world")
+
+	// Open and modify: delete old file, create new file
+	img, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.NoError(t, err)
+
+	err = img.Delete(ext4fs.RootInode, "hello.txt")
+	require.NoError(t, err)
+
+	_, err = img.CreateFile(ext4fs.RootInode, "world.txt", []byte("modified content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = img.Save()
+	require.NoError(t, err)
+	err = img.Close()
+	require.NoError(t, err)
+
+	// Verify modification
+	output = env.dockerExecSimple(
+		`test -f hello.txt && echo "hello exists" || echo "hello deleted"`,
+		`cat world.txt`,
+	)
+	assert.Contains(t, output, "hello deleted")
+	assert.Contains(t, output, "modified content")
+}
+
+func testOpenAndAddFile(t *testing.T) {
+	// Create initial image with some files
+	env := newTestEnv(t, defaultImageSizeMB)
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "original.txt", []byte("original content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	_, err = env.builder.CreateFile(dir, "nested.txt", []byte("nested content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	// Open and add new files without modifying existing ones
+	img, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.NoError(t, err)
+
+	_, err = img.CreateFile(ext4fs.RootInode, "new.txt", []byte("new content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Add file in existing directory
+	_, err = img.CreateFile(dir, "another.txt", []byte("another content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = img.Save()
+	require.NoError(t, err)
+	err = img.Close()
+	require.NoError(t, err)
+
+	// Verify all files exist
+	output := env.dockerExecSimple(
+		`cat original.txt`,
+		`cat new.txt`,
+		`cat subdir/nested.txt`,
+		`cat subdir/another.txt`,
+	)
+	assert.Contains(t, output, "original content")
+	assert.Contains(t, output, "new content")
+	assert.Contains(t, output, "nested content")
+	assert.Contains(t, output, "another content")
+}
+
+func testOpenAndDeleteFile(t *testing.T) {
+	// Create initial image with multiple files
+	env := newTestEnv(t, defaultImageSizeMB)
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "keep.txt", []byte("keep this"), 0644, 0, 0)
+	require.NoError(t, err)
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "delete.txt", []byte("delete this"), 0644, 0, 0)
+	require.NoError(t, err)
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "also_keep.txt", []byte("also keep"), 0644, 0, 0)
+	require.NoError(t, err)
+	env.finalize()
+
+	// Open and delete file
+	img, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.NoError(t, err)
+
+	err = img.Delete(ext4fs.RootInode, "delete.txt")
+	require.NoError(t, err)
+
+	err = img.Save()
+	require.NoError(t, err)
+	err = img.Close()
+	require.NoError(t, err)
+
+	// Verify results
+	output := env.dockerExecSimple(
+		`cat keep.txt`,
+		`test -f delete.txt && echo "delete exists" || echo "delete removed"`,
+		`cat also_keep.txt`,
+	)
+	assert.Contains(t, output, "keep this")
+	assert.Contains(t, output, "delete removed")
+	assert.Contains(t, output, "also keep")
+}
+
+func testOpenInvalidImage(t *testing.T) {
+	tmpDir := t.TempDir()
+	invalidPath := filepath.Join(tmpDir, "invalid.img")
+
+	// Test opening non-existent file
+	_, err := ext4fs.Open(ext4fs.WithExistingImagePath(invalidPath))
+	require.Error(t, err)
+
+	// Create an invalid (empty) file
+	f, err := os.Create(invalidPath)
+	require.NoError(t, err)
+	err = f.Truncate(4 * 1024 * 1024) // 4MB of zeros
+	require.NoError(t, err)
+	err = f.Close()
+	require.NoError(t, err)
+
+	// Test opening invalid ext4 image (wrong magic)
+	_, err = ext4fs.Open(ext4fs.WithExistingImagePath(invalidPath))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid ext4 magic")
+
+	// Test opening standard ext4 image (created by mke2fs with default features)
+	// Standard mke2fs enables features like 64bit, flex_bg, etc. that we don't support
+	standardImgPath := filepath.Join(sharedContainerDir, "standard.img")
+	cmd := exec.Command("docker", "exec", dockerContainerID,
+		"sh", "-c", fmt.Sprintf("mke2fs -t ext4 -q %s 64M && chmod 666 %s", standardImgPath, standardImgPath))
+	if err := cmd.Run(); err == nil {
+		standardHostPath := filepath.Join(sharedHostDir, "standard.img")
+		_, err = ext4fs.Open(ext4fs.WithExistingImagePath(standardHostPath))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported filesystem features")
+		assert.Contains(t, err.Error(), "only images created by this library are supported")
+	}
 }
 
 // =============================================================================

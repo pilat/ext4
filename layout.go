@@ -1,6 +1,7 @@
 package ext4fs
 
 import (
+	"encoding/binary"
 	"fmt"
 )
 
@@ -185,4 +186,87 @@ func (l *Layout) String() string {
 		l.InodesPerGroup,
 		l.InodeTableBlocks,
 		l.TotalFreeBlocks())
+}
+
+// loadLayoutFromDisk reads the superblock from an existing ext4 filesystem
+// and reconstructs the Layout struct from the on-disk metadata.
+// It validates the ext4 magic number, block size (4096), inode size (256),
+// and rejects filesystems with unsupported features (journaling, 64-bit, flex_bg, etc.).
+// Only images created by this library can be opened for modification.
+func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
+	// Read superblock (1024 bytes at offset 1024)
+	sbData := make([]byte, 1024)
+	if err := backend.readAt(sbData, superblockOffset); err != nil {
+		return nil, fmt.Errorf("read superblock: %w", err)
+	}
+
+	// Verify magic number
+	magic := binary.LittleEndian.Uint16(sbData[0x38:0x3A])
+	if magic != ext4Magic {
+		return nil, fmt.Errorf("invalid ext4 magic: 0x%04X (expected 0x%04X)", magic, ext4Magic)
+	}
+
+	// Parse superblock fields
+	blocksCountLo := binary.LittleEndian.Uint32(sbData[0x04:0x08])
+	logBlockSize := binary.LittleEndian.Uint32(sbData[0x18:0x1C])
+	blocksPerGroupSB := binary.LittleEndian.Uint32(sbData[0x20:0x24])
+	inodesPerGroupSB := binary.LittleEndian.Uint32(sbData[0x28:0x2C])
+	inodeSizeSB := binary.LittleEndian.Uint16(sbData[0x58:0x5A])
+	featureIncompat := binary.LittleEndian.Uint32(sbData[0x60:0x64])
+	mkfsTime := binary.LittleEndian.Uint32(sbData[0x108:0x10C])
+
+	// Check for unsupported incompatible features
+	unsupported := featureIncompat &^ incompatSupported
+	if unsupported != 0 {
+		var features []string
+		if unsupported&incompatJournal != 0 {
+			features = append(features, "has_journal")
+		}
+		if unsupported&incompatMetaBG != 0 {
+			features = append(features, "meta_bg")
+		}
+		if unsupported&incompat64bit != 0 {
+			features = append(features, "64bit")
+		}
+		if unsupported&incompatFlexBG != 0 {
+			features = append(features, "flex_bg")
+		}
+		if unsupported&incompatEncrypt != 0 {
+			features = append(features, "encrypt")
+		}
+		if len(features) == 0 {
+			features = append(features, fmt.Sprintf("0x%x", unsupported))
+		}
+		return nil, fmt.Errorf("unsupported filesystem features: %v (only images created by this library are supported)", features)
+	}
+
+	// Validate block size matches our expectation
+	actualBlockSize := uint32(1024) << logBlockSize
+	if actualBlockSize != blockSize {
+		return nil, fmt.Errorf("unsupported block size: %d (expected %d)", actualBlockSize, blockSize)
+	}
+
+	// Validate inode size
+	if inodeSizeSB != inodeSize {
+		return nil, fmt.Errorf("unsupported inode size: %d (expected %d)", inodeSizeSB, inodeSize)
+	}
+
+	// Calculate partition size from block count
+	partitionSize := uint64(blocksCountLo) * blockSize
+
+	// Calculate group count
+	groupCount := (blocksCountLo + blocksPerGroupSB - 1) / blocksPerGroupSB
+
+	layout := &Layout{
+		PartitionStart:   0, // Assume raw ext4 image (no partition offset)
+		PartitionSize:    partitionSize,
+		TotalBlocks:      blocksCountLo,
+		GroupCount:       groupCount,
+		BlocksPerGroup:   blocksPerGroupSB,
+		InodesPerGroup:   inodesPerGroupSB,
+		InodeTableBlocks: (inodesPerGroupSB * uint32(inodeSizeSB)) / blockSize,
+		CreatedAt:        mkfsTime,
+	}
+
+	return layout, nil
 }

@@ -104,6 +104,16 @@ const (
 	incompatFileType = 0x0002
 	incompatExtents  = 0x0040
 
+	// Incompatible features we don't support (for Open validation)
+	incompatJournal = 0x0004  // has_journal
+	incompatMetaBG  = 0x0010  // meta_bg
+	incompat64bit   = 0x0080  // 64bit
+	incompatFlexBG  = 0x0200  // flex_bg
+	incompatEncrypt = 0x10000 // encrypt
+
+	// Mask of incompatible features we support
+	incompatSupported = incompatFileType | incompatExtents
+
 	// Read-only compatible features
 	roCompatSparseSuper = 0x0001
 	roCompatLargeFile   = 0x0002

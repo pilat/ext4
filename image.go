@@ -1,6 +1,7 @@
 package ext4fs
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -52,6 +53,57 @@ func New(opts ...ImageOption) (*Image, error) {
 
 	if err := img.builder.prepareFilesystem(); err != nil {
 		return nil, fmt.Errorf("failed to prepare filesystem: %w", err)
+	}
+
+	return img, nil
+}
+
+// Open opens an existing ext4 filesystem image for modification.
+// The image path must be specified via WithExistingImagePath option.
+// Returns an Image ready for filesystem operations like CreateFile, Delete, Save, and Close.
+//
+// Open reads the superblock to reconstruct filesystem geometry and scans
+// allocation bitmaps to determine which blocks and inodes are already in use.
+// This enables proper allocation for new files without corrupting existing data.
+//
+// Example:
+//
+//	img, err := ext4fs.Open(ext4fs.WithExistingImagePath("disk.img"))
+//	if err != nil {
+//	    return err
+//	}
+//	defer img.Close()
+//
+//	// Modify the filesystem
+//	img.Delete(ext4fs.RootInode, "old-init")
+//	img.CreateFile(ext4fs.RootInode, "init", newInitBinary, 0755, 0, 0)
+//	return img.Save()
+func Open(opts ...ImageOption) (*Image, error) {
+	img := &Image{}
+	for _, opt := range opts {
+		if err := opt(img); err != nil {
+			return nil, err
+		}
+	}
+
+	if img.backend == nil {
+		return nil, errors.New("backend is required: use WithExistingImagePath to open an existing image file")
+	}
+
+	// Load filesystem layout from superblock
+	layout, err := loadLayoutFromDisk(img.backend)
+	if err != nil {
+		_ = img.backend.close()
+		return nil, fmt.Errorf("load filesystem: %w", err)
+	}
+
+	img.createdAt = layout.CreatedAt
+	img.builder = newBuilder(img.backend, layout)
+
+	// Load allocation bitmaps into memory
+	if err := img.builder.loadBitmaps(); err != nil {
+		_ = img.backend.close()
+		return nil, fmt.Errorf("load bitmaps: %w", err)
 	}
 
 	return img, nil

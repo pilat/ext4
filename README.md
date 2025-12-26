@@ -12,9 +12,9 @@ Pure Go ext4 filesystem implementation for creating disk images without external
 
 ## Overview
 
-This library creates ext4 filesystem images suitable for virtual machines and embedded systems. It's designed for building disk images programmatically without requiring root privileges or external tools like `mke2fs`.
+A pure Go library for **creating** ext4 filesystem images programmatically. Designed for building disk images for virtual machines and embedded systems without requiring root privileges or external tools like `mke2fs`.
 
-> **Note**: This is a write-only library for *creating* ext4 images. Reading or modifying existing images is not supported.
+> **Primary use case**: Creating new ext4 images from scratch. Limited support exists for modifying images previously created by this library (e.g., updating `/init` binary). Standard ext4 filesystems created by `mke2fs` cannot be opened due to unsupported features (journaling, 64-bit, flex_bg).
 
 ## Features
 
@@ -31,51 +31,57 @@ go get github.com/pilat/go-ext4fs
 ```
 
 ## Quick Start
+
+### Creating a New Image
 ```go
 package main
 
-import (
-    "github.com/pilat/go-ext4fs"
-)
+import "github.com/pilat/go-ext4fs"
 
 func main() {
     // Create 64MB ext4 image
-    builder, err := ext4fs.New("disk.img", 64)
+    img, err := ext4fs.New(
+        ext4fs.WithImagePath("disk.img"),
+        ext4fs.WithSizeInMB(64),
+    )
     if err != nil {
         panic(err)
     }
-    defer builder.Close()
-
-    // Prepare filesystem
-    if err := builder.PrepareFilesystem(); err != nil {
-        panic(err)
-    }
+    defer img.Close()
 
     // Create directories and files
-    etcDir, err := builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
-    if err != nil {
-        panic(err)
-    }
-
-    _, err = builder.CreateFile(etcDir, "hostname", []byte("myhost\n"), 0644, 0, 0)
-    if err != nil {
-        panic(err)
-    }
-
-    // Create symlinks
-    _, err = builder.CreateSymlink(etcDir, "hosts", "/etc/hostname", 0, 0)
-    if err != nil {
-        panic(err)
-    }
-
-    // Set extended attributes
-    err = builder.SetXattr(etcDir, "user.comment", []byte("System configuration"))
-    if err != nil {
-        panic(err)
-    }
+    etcDir, _ := img.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
+    img.CreateFile(etcDir, "hostname", []byte("myhost\n"), 0644, 0, 0)
+    img.CreateSymlink(etcDir, "hosts", "/etc/hostname", 0, 0)
+    img.SetXattr(etcDir, "user.comment", []byte("System configuration"))
 
     // Finalize and save
-    if err := builder.Save(); err != nil {
+    if err := img.Save(); err != nil {
+        panic(err)
+    }
+}
+```
+
+### Modifying an Existing Image
+```go
+package main
+
+import "github.com/pilat/go-ext4fs"
+
+func main() {
+    // Open existing image (must have been created by this library)
+    img, err := ext4fs.Open(ext4fs.WithExistingImagePath("disk.img"))
+    if err != nil {
+        panic(err)
+    }
+    defer img.Close()
+
+    // Modify: delete old file, add new one
+    newInit := []byte("#!/bin/sh\nexec /bin/sh\n")
+    img.Delete(ext4fs.RootInode, "old-init")
+    img.CreateFile(ext4fs.RootInode, "init", newInit, 0755, 0, 0)
+
+    if err := img.Save(); err != nil {
         panic(err)
     }
 }
