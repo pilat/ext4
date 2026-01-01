@@ -4,99 +4,106 @@ import (
 	"fmt"
 )
 
-// freeBlock marks a block as free in the appropriate block bitmap.
-// This allows previously allocated blocks to be reused for future allocations.
-// The block is added to the free block list for efficient reuse.
-func (b *builder) freeBlock(blockNum uint32) error {
-	group := blockNum / blocksPerGroup
-	indexInGroup := blockNum % blocksPerGroup
+// ============================================================================
+// Free Runs (reusable contiguous blocks)
+// ============================================================================
 
-	gl := b.layout.GetGroupLayout(group)
-	offset := b.layout.BlockOffset(gl.BlockBitmapBlock) + uint64(indexInGroup/8)
-
-	var buf [1]byte
-	if err := b.disk.readAt(buf[:], int64(offset)); err != nil {
-		return fmt.Errorf("failed to read block bitmap for freeing block %d: %w", blockNum, err)
+// freeBlockRun marks blocks as free and stores run for reuse.
+func (b *builder) freeBlockRun(start, count uint32) error {
+	for i := uint32(0); i < count; i++ {
+		if err := b.clearBlockBit(start + i); err != nil {
+			return err
+		}
+		group := (start + i) / blocksPerGroup
+		b.freedBlocksPerGroup[group]++
 	}
-
-	buf[0] &^= 1 << (indexInGroup % 8) // Clear the bit
-	if err := b.disk.writeAt(buf[:], int64(offset)); err != nil {
-		return fmt.Errorf("failed to write block bitmap for freeing block %d: %w", blockNum, err)
-	}
-
-	// Track freed blocks for accurate count and reuse
-	b.freedBlocksPerGroup[group]++
-	b.freeBlockList = append(b.freeBlockList, blockNum)
-
+	b.addFreeRun(freeRun{start: start, count: count})
 	return nil
 }
 
-// allocateBlock allocates a single free block from the filesystem.
-// It first tries to reuse blocks from the free block list, then searches
-// block groups for available blocks. Returns the allocated block number.
-func (b *builder) allocateBlock() (uint32, error) {
-	// First, try to reuse a freed block
-	if len(b.freeBlockList) > 0 {
-		block := b.freeBlockList[len(b.freeBlockList)-1]
-		b.freeBlockList = b.freeBlockList[:len(b.freeBlockList)-1]
-
-		group := block / blocksPerGroup
-		b.freedBlocksPerGroup[group]--
-
-		if err := b.markBlockUsed(block); err != nil {
-			return 0, fmt.Errorf("failed to mark reused block as used: %w", err)
-		}
-
-		return block, nil
+// addFreeRun adds a free run to freeRuns, maintaining sorted order by count (ascending).
+// This is used during Open() when scanning existing bitmaps for holes.
+func (b *builder) addFreeRun(run freeRun) {
+	pos := 0
+	for pos < len(b.freeRuns) && b.freeRuns[pos].count < run.count {
+		pos++
 	}
-
-	// Otherwise allocate new block
-	for g := uint32(0); g < b.layout.GroupCount; g++ {
-		gl := b.layout.GetGroupLayout(g)
-		groupEnd := gl.GroupStart + gl.BlocksInGroup
-
-		if b.nextBlockPerGroup[g] < groupEnd {
-			block := b.nextBlockPerGroup[g]
-
-			b.nextBlockPerGroup[g]++
-			if err := b.markBlockUsed(block); err != nil {
-				return 0, fmt.Errorf("failed to mark allocated block as used: %w", err)
-			}
-
-			return block, nil
-		}
-	}
-
-	return 0, fmt.Errorf("out of blocks")
+	b.freeRuns = append(b.freeRuns, freeRun{})
+	copy(b.freeRuns[pos+1:], b.freeRuns[pos:])
+	b.freeRuns[pos] = run
 }
 
-// allocateBlocks allocates n consecutive free blocks from the filesystem.
-// For small allocations, it tries to find contiguous blocks within a single group.
-// For larger allocations, it may allocate across multiple groups.
-// Returns a slice of allocated block numbers.
+// ============================================================================
+// Block Allocation
+// ============================================================================
+
+// allocateBlocks allocates n contiguous blocks.
+// First tries best-fit from freeRuns, then allocates fresh.
 func (b *builder) allocateBlocks(n uint32) ([]uint32, error) {
 	if n == 0 {
 		return nil, nil
 	}
+	if run, idx := b.findBestFit(n); run != nil {
+		return b.takeFromRun(idx, n)
+	}
+	return b.allocateFreshBlocks(n)
+}
 
-	blocks := make([]uint32, 0, n)
+// allocateBlock allocates a single block.
+func (b *builder) allocateBlock() (uint32, error) {
+	blocks, err := b.allocateBlocks(1)
+	if err != nil {
+		return 0, err
+	}
+	return blocks[0], nil
+}
 
-	// First, use freed blocks
-	for len(blocks) < int(n) && len(b.freeBlockList) > 0 {
-		block := b.freeBlockList[len(b.freeBlockList)-1]
-		b.freeBlockList = b.freeBlockList[:len(b.freeBlockList)-1]
+// ============================================================================
+// Block Allocation Helpers
+// ============================================================================
 
-		group := block / blocksPerGroup
+// findBestFit finds smallest run >= n (best-fit algorithm).
+// Returns nil if no suitable run exists.
+func (b *builder) findBestFit(n uint32) (*freeRun, int) {
+	for i, run := range b.freeRuns {
+		if run.count >= n {
+			return &b.freeRuns[i], i
+		}
+	}
+	return nil, -1
+}
+
+// takeFromRun consumes n blocks from run, shrinks/removes it.
+func (b *builder) takeFromRun(idx int, n uint32) ([]uint32, error) {
+	run := b.freeRuns[idx]
+
+	blocks := make([]uint32, n)
+	for j := uint32(0); j < n; j++ {
+		blocks[j] = run.start + j
+
+		group := blocks[j] / blocksPerGroup
 		b.freedBlocksPerGroup[group]--
 
-		if err := b.markBlockUsed(block); err != nil {
+		if err := b.setBlockBit(blocks[j]); err != nil {
 			return nil, fmt.Errorf("failed to mark reused block as used: %w", err)
 		}
-
-		blocks = append(blocks, block)
 	}
 
-	// Then allocate new blocks
+	// Remove this run from the list
+	b.freeRuns = append(b.freeRuns[:idx], b.freeRuns[idx+1:]...)
+
+	// If there's remainder, re-insert it sorted
+	if run.count > n {
+		b.addFreeRun(freeRun{start: run.start + n, count: run.count - n})
+	}
+
+	return blocks, nil
+}
+
+// allocateFreshBlocks allocates n consecutive new blocks from groups.
+func (b *builder) allocateFreshBlocks(n uint32) ([]uint32, error) {
+	blocks := make([]uint32, 0, n)
+
 	for len(blocks) < int(n) {
 		found := false
 
@@ -114,9 +121,9 @@ func (b *builder) allocateBlocks(n uint32) ([]uint32, error) {
 
 				for i := uint32(0); i < toAlloc; i++ {
 					block := b.nextBlockPerGroup[g]
-
 					b.nextBlockPerGroup[g]++
-					if err := b.markBlockUsed(block); err != nil {
+
+					if err := b.setBlockBit(block); err != nil {
 						return nil, fmt.Errorf("failed to mark allocated block as used: %w", err)
 					}
 
@@ -124,7 +131,6 @@ func (b *builder) allocateBlocks(n uint32) ([]uint32, error) {
 				}
 
 				found = true
-
 				if len(blocks) >= int(n) {
 					break
 				}
@@ -139,44 +145,12 @@ func (b *builder) allocateBlocks(n uint32) ([]uint32, error) {
 	return blocks, nil
 }
 
-// allocateInode allocates the next available inode number.
-// It first tries to reuse freed inodes, then allocates sequentially.
-// Returns the allocated inode number or an error if no inodes are available.
-func (b *builder) allocateInode() (uint32, error) {
-	// First, try to reuse a freed inode
-	if len(b.freeInodeList) > 0 {
-		inodeNum := b.freeInodeList[len(b.freeInodeList)-1]
-		b.freeInodeList = b.freeInodeList[:len(b.freeInodeList)-1]
+// ============================================================================
+// Block Bitmap Operations
+// ============================================================================
 
-		group := (inodeNum - 1) / inodesPerGroup
-		b.freedInodesPerGroup[group]--
-
-		if err := b.markInodeUsed(inodeNum); err != nil {
-			return 0, fmt.Errorf("failed to mark reused inode as used: %w", err)
-		}
-
-		return inodeNum, nil
-	}
-
-	// Otherwise allocate new inode
-	if b.nextInode > b.layout.TotalInodes() {
-		return 0, fmt.Errorf("out of inodes: %d", b.nextInode)
-	}
-
-	inodeNum := b.nextInode
-
-	b.nextInode++
-	if err := b.markInodeUsed(inodeNum); err != nil {
-		return 0, fmt.Errorf("failed to mark allocated inode as used: %w", err)
-	}
-
-	return inodeNum, nil
-}
-
-// markBlockUsed marks the specified block as used in its group's block bitmap.
-// This prevents the block from being allocated again until it is explicitly freed.
-// The bitmap is updated on disk to reflect the new allocation state.
-func (b *builder) markBlockUsed(blockNum uint32) error {
+// setBlockBit marks the specified block as used in the bitmap.
+func (b *builder) setBlockBit(blockNum uint32) error {
 	group := blockNum / blocksPerGroup
 	indexInGroup := blockNum % blocksPerGroup
 
@@ -185,52 +159,98 @@ func (b *builder) markBlockUsed(blockNum uint32) error {
 
 	var buf [1]byte
 	if err := b.disk.readAt(buf[:], int64(offset)); err != nil {
-		return fmt.Errorf("failed to read block bitmap for marking block %d used: %w", blockNum, err)
+		return fmt.Errorf("read block bitmap for block %d: %w", blockNum, err)
 	}
 
 	buf[0] |= 1 << (indexInGroup % 8)
+
 	if err := b.disk.writeAt(buf[:], int64(offset)); err != nil {
-		return fmt.Errorf("failed to write block bitmap for marking block %d used: %w", blockNum, err)
+		return fmt.Errorf("write block bitmap for block %d: %w", blockNum, err)
 	}
 
 	return nil
 }
 
-// freeInode marks the specified inode as free in its group's inode bitmap.
-// This allows the inode to be reused for future allocations.
-// Inode 0 is invalid and should never be freed.
+// clearBlockBit marks the specified block as free in the bitmap.
+func (b *builder) clearBlockBit(blockNum uint32) error {
+	group := blockNum / blocksPerGroup
+	indexInGroup := blockNum % blocksPerGroup
+
+	gl := b.layout.GetGroupLayout(group)
+	offset := b.layout.BlockOffset(gl.BlockBitmapBlock) + uint64(indexInGroup/8)
+
+	var buf [1]byte
+	if err := b.disk.readAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("read block bitmap for freeing block %d: %w", blockNum, err)
+	}
+
+	buf[0] &^= 1 << (indexInGroup % 8)
+
+	if err := b.disk.writeAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("write block bitmap for freeing block %d: %w", blockNum, err)
+	}
+
+	return nil
+}
+
+// ============================================================================
+// Inode Allocation
+// ============================================================================
+
+// allocateInode allocates the next available inode number.
+// First tries to reuse freed inodes, then allocates sequentially.
+func (b *builder) allocateInode() (uint32, error) {
+	if len(b.freeInodeList) > 0 {
+		inodeNum := b.freeInodeList[len(b.freeInodeList)-1]
+		b.freeInodeList = b.freeInodeList[:len(b.freeInodeList)-1]
+
+		group := (inodeNum - 1) / inodesPerGroup
+		b.freedInodesPerGroup[group]--
+
+		if err := b.setInodeBit(inodeNum); err != nil {
+			return 0, fmt.Errorf("failed to mark reused inode as used: %w", err)
+		}
+
+		return inodeNum, nil
+	}
+
+	if b.nextInode > b.layout.TotalInodes() {
+		return 0, fmt.Errorf("out of inodes: %d", b.nextInode)
+	}
+
+	inodeNum := b.nextInode
+	b.nextInode++
+
+	if err := b.setInodeBit(inodeNum); err != nil {
+		return 0, fmt.Errorf("failed to mark allocated inode as used: %w", err)
+	}
+
+	return inodeNum, nil
+}
+
+// freeInode marks the specified inode as free for reuse.
 func (b *builder) freeInode(inodeNum uint32) error {
 	if inodeNum < 1 {
 		return nil
 	}
 
+	if err := b.clearInodeBit(inodeNum); err != nil {
+		return err
+	}
+
 	group := (inodeNum - 1) / inodesPerGroup
-	indexInGroup := (inodeNum - 1) % inodesPerGroup
-
-	gl := b.layout.GetGroupLayout(group)
-	offset := b.layout.BlockOffset(gl.InodeBitmapBlock) + uint64(indexInGroup/8)
-
-	var buf [1]byte
-	if err := b.disk.readAt(buf[:], int64(offset)); err != nil {
-		return fmt.Errorf("failed to read inode bitmap for freeing inode %d: %w", inodeNum, err)
-	}
-
-	buf[0] &^= 1 << (indexInGroup % 8) // Clear the bit
-	if err := b.disk.writeAt(buf[:], int64(offset)); err != nil {
-		return fmt.Errorf("failed to write inode bitmap for freeing inode %d: %w", inodeNum, err)
-	}
-
-	// Track freed inodes for accurate count and reuse
 	b.freedInodesPerGroup[group]++
 	b.freeInodeList = append(b.freeInodeList, inodeNum)
 
 	return nil
 }
 
-// markInodeUsed marks the specified inode as used in its group's inode bitmap.
-// This prevents the inode from being allocated again and updates the bitmap on disk.
-// Inode 0 is invalid and should never be marked as used.
-func (b *builder) markInodeUsed(inodeNum uint32) error {
+// ============================================================================
+// Inode Bitmap Operations
+// ============================================================================
+
+// setInodeBit marks the specified inode as used in the bitmap.
+func (b *builder) setInodeBit(inodeNum uint32) error {
 	if inodeNum < 1 {
 		return nil
 	}
@@ -243,12 +263,39 @@ func (b *builder) markInodeUsed(inodeNum uint32) error {
 
 	var buf [1]byte
 	if err := b.disk.readAt(buf[:], int64(offset)); err != nil {
-		return fmt.Errorf("failed to read inode bitmap for marking inode %d used: %w", inodeNum, err)
+		return fmt.Errorf("read inode bitmap for inode %d: %w", inodeNum, err)
 	}
 
 	buf[0] |= 1 << (indexInGroup % 8)
+
 	if err := b.disk.writeAt(buf[:], int64(offset)); err != nil {
-		return fmt.Errorf("failed to write inode bitmap for marking inode %d used: %w", inodeNum, err)
+		return fmt.Errorf("write inode bitmap for inode %d: %w", inodeNum, err)
+	}
+
+	return nil
+}
+
+// clearInodeBit marks the specified inode as free in the bitmap.
+func (b *builder) clearInodeBit(inodeNum uint32) error {
+	if inodeNum < 1 {
+		return nil
+	}
+
+	group := (inodeNum - 1) / inodesPerGroup
+	indexInGroup := (inodeNum - 1) % inodesPerGroup
+
+	gl := b.layout.GetGroupLayout(group)
+	offset := b.layout.BlockOffset(gl.InodeBitmapBlock) + uint64(indexInGroup/8)
+
+	var buf [1]byte
+	if err := b.disk.readAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("read inode bitmap for freeing inode %d: %w", inodeNum, err)
+	}
+
+	buf[0] &^= 1 << (indexInGroup % 8)
+
+	if err := b.disk.writeAt(buf[:], int64(offset)); err != nil {
+		return fmt.Errorf("write inode bitmap for freeing inode %d: %w", inodeNum, err)
 	}
 
 	return nil

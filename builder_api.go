@@ -652,7 +652,7 @@ func (b *builder) removeXattr(inodeNum uint32, name string) error {
 
 	if len(newEntries) == 0 {
 		// Free the xattr block
-		if err := b.freeBlock(inode.FileACLLo); err != nil {
+		if err := b.freeBlockRun(inode.FileACLLo, 1); err != nil {
 			return fmt.Errorf("failed to free xattr block during removal: %w", err)
 		}
 
