@@ -254,7 +254,7 @@ func (b *builder) createRootDirectory() error {
 		return fmt.Errorf("failed to write root inode: %w", err)
 	}
 
-	if err := b.markInodeUsed(RootInode); err != nil {
+	if err := b.setInodeBit(RootInode); err != nil {
 		return fmt.Errorf("failed to mark root inode as used: %w", err)
 	}
 

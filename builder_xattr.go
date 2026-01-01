@@ -63,35 +63,66 @@ func xattrIndexToPrefix(index uint8) string {
 func (b *builder) freeOldFileResources(oldInode *inode) error {
 	// Free the xattr block if present
 	if oldInode.FileACLLo != 0 {
-		if err := b.freeBlock(oldInode.FileACLLo); err != nil {
+		if err := b.freeBlockRun(oldInode.FileACLLo, 1); err != nil {
 			return fmt.Errorf("failed to free xattr block during overwrite: %w", err)
 		}
 	}
 
-	// Free the old blocks
-	oldBlocks, err := b.getInodeBlocks(oldInode)
-	if err != nil {
-		return fmt.Errorf("failed to get old inode blocks during overwrite: %w", err)
-	}
-
-	for _, blk := range oldBlocks {
-		if err := b.freeBlock(blk); err != nil {
-			return fmt.Errorf("failed to free old block %d during overwrite: %w", blk, err)
+	// Free extent runs directly (not individual blocks)
+	if (oldInode.Flags & inodeFlagExtents) != 0 {
+		if err := b.freeInodeExtentRuns(oldInode); err != nil {
+			return fmt.Errorf("failed to free extent runs: %w", err)
 		}
 	}
 
-	// If the old inode had an extent tree (depth > 0), free the index blocks too
-	if (oldInode.Flags & inodeFlagExtents) != 0 {
-		depth := binary.LittleEndian.Uint16(oldInode.Block[6:8])
-		if depth > 0 {
-			entries := binary.LittleEndian.Uint16(oldInode.Block[2:4])
-			for i := uint16(0); i < entries && i < 4; i++ {
-				off := 12 + i*12
+	return nil
+}
 
-				leafBlock := binary.LittleEndian.Uint32(oldInode.Block[off+4:])
-				if err := b.freeBlock(leafBlock); err != nil {
-					return fmt.Errorf("failed to free extent leaf block %d during overwrite: %w", leafBlock, err)
+// freeInodeExtentRuns frees all extent runs from an inode, preserving contiguity.
+func (b *builder) freeInodeExtentRuns(inode *inode) error {
+	entries := binary.LittleEndian.Uint16(inode.Block[2:4])
+	depth := binary.LittleEndian.Uint16(inode.Block[6:8])
+
+	if entries == 0 {
+		return nil
+	}
+
+	if depth == 0 {
+		// Leaf extents in inode
+		for i := uint16(0); i < entries && i < 4; i++ {
+			off := 12 + i*12
+			length := binary.LittleEndian.Uint16(inode.Block[off+4:])
+			startLo := binary.LittleEndian.Uint32(inode.Block[off+8:])
+
+			if err := b.freeBlockRun(startLo, uint32(length)); err != nil {
+				return err
+			}
+		}
+	} else {
+		// Extent tree: free leaf block extents, then the leaf blocks themselves
+		for i := uint16(0); i < entries && i < 4; i++ {
+			off := 12 + i*12
+			leafBlock := binary.LittleEndian.Uint32(inode.Block[off+4:])
+
+			leafData := make([]byte, blockSize)
+			if err := b.disk.readAt(leafData, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+				return fmt.Errorf("failed to read extent leaf block %d: %w", leafBlock, err)
+			}
+
+			leafEntries := binary.LittleEndian.Uint16(leafData[2:4])
+			for j := uint16(0); j < leafEntries; j++ {
+				extOff := 12 + j*12
+				length := binary.LittleEndian.Uint16(leafData[extOff+4:])
+				startLo := binary.LittleEndian.Uint32(leafData[extOff+8:])
+
+				if err := b.freeBlockRun(startLo, uint32(length)); err != nil {
+					return err
 				}
+			}
+
+			// Free the leaf block itself
+			if err := b.freeBlockRun(leafBlock, 1); err != nil {
+				return err
 			}
 		}
 	}

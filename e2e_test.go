@@ -163,6 +163,7 @@ func TestExt4FS(t *testing.T) {
 		{"DeleteMultipleFiles", testDeleteMultipleFiles},
 		{"DeleteDirectoryDeep", testDeleteDirectoryDeep},
 		{"DeleteLargeFile", testDeleteLargeFile},
+		{"DeleteLargeDirectory", testDeleteLargeDirectory},
 		{"DeleteSlowSymlink", testDeleteSlowSymlink},
 		{"DeleteDirectoryWithXattr", testDeleteDirectoryWithXattr},
 		{"DeleteNotFound", testDeleteNotFound},
@@ -174,6 +175,7 @@ func TestExt4FS(t *testing.T) {
 		{"OpenAndAddFile", testOpenAndAddFile},
 		{"OpenAndDeleteFile", testOpenAndDeleteFile},
 		{"OpenInvalidImage", testOpenInvalidImage},
+		{"LargeFileAfterDeletes", testLargeFileAfterDeletes},
 	}
 
 	for _, tc := range tests {
@@ -1470,7 +1472,13 @@ func testXattrList(t *testing.T) {
 	fileInode, err := env.builder.CreateFile(ext4fs.RootInode, "list_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
 
-	expectedAttrs := []string{"user.alpha", "user.beta", "user.gamma"}
+	// Test multiple namespaces to cover xattrIndexToPrefix branches
+	expectedAttrs := []string{
+		"user.alpha",
+		"user.beta",
+		"security.selinux",
+		"trusted.overlay",
+	}
 
 	for _, attr := range expectedAttrs {
 		err = env.builder.SetXattr(fileInode, attr, []byte("value"))
@@ -1487,9 +1495,9 @@ func testXattrList(t *testing.T) {
 
 	env.finalize()
 
-	output := env.dockerExecSimple(`getfattr -d list_xattr.txt | grep -c "user\\." || echo "0"`)
-
-	assert.Contains(t, output, "3")
+	output := env.dockerExecSimple(`getfattr -d -m ".*" list_xattr.txt 2>/dev/null | grep -E "^(user|security|trusted)\." | wc -l`)
+	// Should have 4 attrs listed
+	assert.Contains(t, output, "4")
 }
 
 func testXattrComplexFilesystem(t *testing.T) {
@@ -1975,6 +1983,43 @@ func testDeleteLargeFile(t *testing.T) {
 	assert.Contains(t, output, "reused blocks")
 }
 
+func testDeleteLargeDirectory(t *testing.T) {
+	env := newTestEnv(t, 128)
+
+	// Create a directory with many files to trigger extent tree conversion.
+	// A directory needs >4 non-contiguous blocks to have an extent tree.
+	// Long filenames help fill blocks quickly.
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "bigdir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	// Create 1000 files with long names to fill multiple directory blocks
+	for i := 0; i < 1000; i++ {
+		fileName := fmt.Sprintf("file_with_a_reasonably_long_name_to_fill_blocks_%04d.txt", i)
+		_, err = env.builder.CreateFile(dir, fileName, []byte("content"), 0644, 0, 0)
+		require.NoError(t, err)
+	}
+
+	// Delete the large directory recursively (should free extent tree blocks)
+	err = env.builder.DeleteDirectory(ext4fs.RootInode, "bigdir")
+	require.NoError(t, err)
+
+	// Verify we can still create new files (blocks were properly freed)
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "after_delete.txt", []byte("success"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -d "bigdir" && echo "bigdir exists" || echo "bigdir deleted"`,
+		`test -f "after_delete.txt" && echo "after_delete.txt exists"`,
+		`cat after_delete.txt`,
+	)
+
+	assert.Contains(t, output, "bigdir deleted")
+	assert.Contains(t, output, "after_delete.txt exists")
+	assert.Contains(t, output, "success")
+}
+
 func testDeleteSlowSymlink(t *testing.T) {
 	env := newTestEnv(t, defaultImageSizeMB)
 
@@ -2399,6 +2444,59 @@ func testOpenInvalidImage(t *testing.T) {
 		assert.Contains(t, err.Error(), "unsupported filesystem features")
 		assert.Contains(t, err.Error(), "only images created by this library are supported")
 	}
+}
+
+// testLargeFileAfterDeletes verifies that creating a large file after deleting
+// many small files does not cause excessive fragmentation leading to "too many extents".
+//
+// Bug scenario: allocateBlocks() prioritizes freed blocks (scattered) over consecutive
+// blocks. When many files are deleted, their freed blocks are scattered across the disk.
+// Creating a large file then allocates these scattered blocks first, causing each block
+// to become a separate extent. If the file needs more blocks than maxTotalExtents (1360),
+// file creation fails with "too many extents" error.
+//
+// This test creates ~2000 single-block files, deletes them all, then creates a large file
+// requiring ~2000 blocks. With the bug, this would create ~2000 extents (exceeding 1360 max).
+// The fix should allocate consecutive blocks for large files, keeping extent count low.
+func testLargeFileAfterDeletes(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	const numFiles = 2000
+
+	// Step 1: Create many small files (each uses 1 block)
+	// These will allocate consecutive blocks initially
+	for i := 0; i < numFiles; i++ {
+		content := make([]byte, 100) // Small content, fits in 1 block
+		_, err := env.builder.CreateFile(ext4fs.RootInode, fmt.Sprintf("temp_%04d.txt", i), content, 0644, 0, 0)
+		require.NoError(t, err, "failed to create temp file %d", i)
+	}
+
+	// Step 2: Delete all files to populate the free block list with scattered blocks
+	for i := 0; i < numFiles; i++ {
+		err := env.builder.Delete(ext4fs.RootInode, fmt.Sprintf("temp_%04d.txt", i))
+		require.NoError(t, err, "failed to delete temp file %d", i)
+	}
+
+	// Step 3: Create a large file that needs ~2000 blocks
+	// With the bug: allocates 2000 scattered freed blocks = 2000 extents (fails: max is 1360)
+	// With the fix: allocates consecutive blocks = 1 extent (succeeds)
+	largeContent := make([]byte, numFiles*4096) // ~8MB, needs ~2000 blocks
+	for i := range largeContent {
+		largeContent[i] = byte(i % 256)
+	}
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "large_file.bin", largeContent, 0644, 0, 0)
+	require.NoError(t, err, "failed to create large file after deletes - likely too many extents due to fragmentation")
+
+	env.finalize()
+
+	// Verify the large file is readable and correct on real Linux kernel
+	output := env.dockerExecSimple(
+		`stat -c "%s" large_file.bin`,
+		`ls -la large_file.bin`,
+	)
+
+	expectedSize := fmt.Sprintf("%d", numFiles*4096)
+	assert.Contains(t, output, expectedSize, "large file should have correct size")
 }
 
 // =============================================================================

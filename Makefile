@@ -14,7 +14,7 @@ all: fmt lint tests
 
 tests:
 	@echo "===> Running end-to-end tests"
-	go test $(LDFLAGS) -v ./...
+	go test $(LDFLAGS) -v -count=1 ./...
 
 coverage:
 	@echo "===> Running tests with coverage"
